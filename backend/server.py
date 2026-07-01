@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import anthropic
 from openai import AsyncOpenAI
 from pypdf import PdfReader
+import certifi
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -25,7 +26,7 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']          # replaces EMERGENT_LLM_KEY
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
 
-mongo_client = AsyncIOMotorClient(MONGO_URL)
+mongo_client = AsyncIOMotorClient(MONGO_URL, tls=True, tlsCAFile=certifi.where())
 db = mongo_client[DB_NAME]
 
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
