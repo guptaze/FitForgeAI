@@ -26,7 +26,7 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']          # replaces EMERGENT_LLM_KEY
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
 
-mongo_client = AsyncIOMotorClient(MONGO_URL, tls=True, tlsCAFile=certifi.where())
+mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client[DB_NAME]
 
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
