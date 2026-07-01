@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "FitForge AI",
+    "slug": "frontend",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "frontend",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Record voice notes for check-ins and food logging",
+        "NSCameraUsageDescription": "Capture food photos for calorie estimation",
+        "NSPhotoLibraryUsageDescription": "Pick food photos for calorie estimation",
+        "NSHealthShareUsageDescription": "Read your daily fitness metrics to track progress",
+        "NSHealthUpdateUsageDescription": "Save workouts and body metrics to Apple Health"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#121212"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "RECORD_AUDIO",
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#121212"
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Record voice notes for check-ins and food logging"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Pick food photos for calorie estimation",
+          "cameraPermission": "Capture food photos for calorie estimation"
+        }
+      ],
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

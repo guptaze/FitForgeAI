@@ -1,0 +1,28 @@
+export const theme = {
+  color: {
+    surface: "#121212",
+    onSurface: "#F5F5F5",
+    surfaceSecondary: "#1C1C1E",
+    onSurfaceSecondary: "#E0E0E0",
+    surfaceTertiary: "#2C2C2E",
+    onSurfaceTertiary: "#D4D4D4",
+    brand: "#F35900",
+    onBrand: "#FFFFFF",
+    brandSecondary: "#D84315",
+    brandTertiary: "rgba(243, 89, 0, 0.15)",
+    success: "#00C853",
+    warning: "#FFAB00",
+    error: "#D50000",
+    info: "#00B0FF",
+    border: "#333333",
+    borderStrong: "#555555",
+    divider: "#2A2A2A",
+    muted: "#8A8A8E",
+  },
+  spacing: { xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32, xxxl: 48 },
+  radius: { sm: 6, md: 12, lg: 20, pill: 999 },
+  font: {
+    display: "System",
+    text: "System",
+  },
+} as const;

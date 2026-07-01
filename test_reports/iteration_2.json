@@ -1,0 +1,82 @@
+{
+  "summary": "FitForge AI iteration 2 tested end-to-end. Backend pytest: 15/18 passing. Failures are all in the plan-generation path — Claude Sonnet 4.6 with the new expanded schema (targets, meal_plan with 2-3 options per meal, per-exercise demo_query/image_query/muscle_group, supplement bloodwork metadata) is BLOWING PAST the 6500-token max — resulting in truncated JSON and a 500 'Claude returned non-JSON. Try again.' Backend log confirms `json.decoder.JSONDecodeError: Expecting ',' delimiter: line 524 column 6 (char 20790)`. Because generation fails, the persisted plan in DB is still the iteration-1 shape (no `targets` / `meal_plan`), so /api/plan/latest fails the new schema validation too. Bloodwork upload-image with a 1x1 JPEG returns HTTP 500 because Anthropic rejects the image with 'Could not process image' — the endpoint's docstring/schema says unreadable input should return markers:[] + overall_summary, but the exception isn't caught to produce that fallback. All other new endpoints are green: /api/overview returns the correct shape, /api/workouts/log + /api/workouts/today + DELETE roundtrip works, /api/bloodwork/upload-pdf works end-to-end (Claude parsed our reportlab-generated PDF), /api/bloodwork/latest returns the persisted record. Frontend smoke on mobile viewport 390x844: HOME/PLAN/[FAB]/BLOOD tab bar renders, tapping the central FAB opens the quick-log bottom sheet with all 4 action cards (opt-checkin, opt-food-voice, opt-food-camera, opt-food-gallery), Home shows all 5 cards (weight, calories, checkin, health with MOCKED badge, food log), Plan tab renders TODAY'S WORKOUT with DEMO + LOG buttons per exercise and all collapsible sections, Bloodwork empty state renders with Camera/Gallery/PDF upload buttons. Console warnings observed: 'props.pointerEvents is deprecated' (from _layout.tsx:11 FabButton) and 'shadow* style props are deprecated' (from fab shadow styles).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/plan/generate",
+        "issue": "Claude Sonnet 4.6 output is truncated because the new iteration-2 schema is too big to fit in max_tokens=6500. Backend logs show repeated `Plan JSON parse failed` -> `json.decoder.JSONDecodeError: Expecting ',' delimiter: line 524 column 6 (char 20790)`. API returns HTTP 500 'Claude returned non-JSON. Try again.' after ~60s locally (public URL still 502s at the ingress). Even if a partial call succeeds occasionally, the DB currently holds only iteration-1 schema plans (no targets, no meal_plan). Fix options: (a) raise max_tokens to ~10000, (b) trim schema (drop image_query, fewer meal options), (c) split into 2 sequential calls (training/nutrition), or (d) instruct Claude to emit compact JSON without whitespace. Also add a graceful frontend fallback that polls /api/plan/latest after a POST failure.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "GET /api/plan/latest",
+        "issue": "Consequence of the above — latest persisted plan is missing new schema keys `targets` and `meal_plan`. Will self-heal once /plan/generate returns valid JSON. Not a code bug per se, but validates the blast radius of the generation failure.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "POST /api/bloodwork/upload-image",
+        "issue": "1x1 or otherwise unprocessable JPEG causes Anthropic to reject with `AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Could not process image\"}}` which bubbles up as HTTP 500 'Bloodwork image analysis failed.' The BLOODWORK_PROMPT instructs Claude to `return markers:[] and set overall_summary explaining what you couldn't parse` for unreadable input, but that path is unreachable because litellm raises before Claude sees the request. Catch this BadRequestError in bloodwork_upload_image() (and in food_log_image) and return a 200 with markers:[], suggestions.overall_summary='Image could not be processed. Please upload a clearer photo of your blood report.'",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/plan/generate (public URL)",
+        "issue": "Ingress still returns 502 at ~60s (same as iteration_1). Testing agent uses http://localhost:8001 fallback. Frontend users hit CTA and see error toast."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Plan generation from onboarding form",
+        "issue": "Because /api/plan/generate is currently returning 500 (truncated JSON) even locally, and 502 through the ingress, users cannot generate a new iteration-2 plan. The Plan tab therefore keeps rendering the old iteration-1 plan cached in the DB, which is missing `targets` and `meal_plan`. Frontend degrades gracefully (shows 'Regenerate the plan to see targets' hint) but the new features (target header, meal plan alternates) will never populate until the plan-generation JSON issue is fixed.",
+        "affected_testIDs": ["generate-plan-button"]
+      },
+      {
+        "flow": "Bloodwork image upload from Camera / Gallery",
+        "issue": "Any low-quality / small photo will return 500 with raw Anthropic error surfaced in the alert. Should degrade to a 200 + user-friendly overall_summary as per backend prompt."
+      }
+    ],
+    "design_issues": [],
+    "react_native_issues": [
+      {
+        "component": "FabButton in (tabs)/_layout.tsx",
+        "issue": "Uses deprecated `pointerEvents=\"box-none\"` prop on <View>. Console warns 'props.pointerEvents is deprecated. Use style.pointerEvents'. Reference: /app/frontend/app/(tabs)/_layout.tsx:11"
+      },
+      {
+        "component": "FabButton shadow styles",
+        "issue": "Uses deprecated shadowColor/shadowOpacity/shadowRadius/shadowOffset. Console warns '\"shadow*\" style props are deprecated. Use \"boxShadow\".' Reference: /app/frontend/app/(tabs)/_layout.tsx:102-105"
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fitforge_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "URGENT: Fix /api/plan/generate JSON truncation. Recommended: raise max_tokens from 6500 to ~10000 AND/OR trim schema (e.g. drop image_query field, cap meal_plan to 2 options, tighten system prompt wording). Verify a full response fits under both the token cap and the ~60s ingress budget.",
+    "Catch litellm BadRequestError('Could not process image') in POST /api/bloodwork/upload-image and POST /api/food/log-image; return a 200 with markers:[]/food_items:[] + a friendly overall_summary/notes instead of a 500.",
+    "Consider async job pattern (POST returns 202+id, GET /api/plan/status/{id}) to sidestep the 60s ingress cap permanently, OR have the frontend poll /api/plan/latest on POST failure.",
+    "Frontend: migrate FabButton in /app/frontend/app/(tabs)/_layout.tsx to `style={{ pointerEvents: 'box-none' }}` and replace shadowColor/shadowOpacity/shadowRadius/shadowOffset with `boxShadow` (or import Platform.select for iOS/native fallback).",
+    "Frontend: after a fresh /plan/generate call, invalidate the AsyncStorage `fitforge_latest_plan` cache so users see the new-schema plan (target header + meal alternates) as soon as backend is fixed."
+  ],
+  "critical_code_review_comments": [
+    "server.py:186 call_claude_json — max_tokens default 6500 is too small for the iteration-2 plan schema. Add per-endpoint tuning or make it a parameter with sensible per-flow defaults.",
+    "server.py:474-497 bloodwork_upload_image / 337-360 food_log_image — bare `except Exception` swallows the specific `litellm.BadRequestError: Could not process image` path that the prompt is designed to gracefully handle. Add an explicit branch that returns a 200 with an empty markers/food_items list and overall_summary/notes.",
+    "server.py:47-55 extract_json — no defensive handling for truncated JSON. Consider a partial-parse fallback (e.g. attempt json5 or bracket-balancing) or return the LLM raw text back so the frontend can display a friendlier error.",
+    "server.py: /api/bloodwork/upload-pdf reads entire PDF into memory and slices to 15000 chars — fine for now, but flag if users can upload large multi-page reports.",
+    "(tabs)/_layout.tsx: pointerEvents=box-none prop + shadow* styles trigger repeated React Native deprecation warnings on every render — should migrate to style.pointerEvents / boxShadow.",
+    "quick-log.tsx:91 uses new `mediaTypes: ['images']` correctly (iteration-1 issue fixed). No regression."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fitforge_api.py (expanded from iteration_1 to cover /api/overview, /api/workouts/*, /api/bloodwork/upload-image, /api/bloodwork/upload-pdf, /api/bloodwork/latest; plan validation now checks new keys targets/meal_plan and per-exercise demo_query/muscle_group; PDF is generated in-process via reportlab)",
+    "/app/test_reports/pytest/pytest_results.xml (regenerated)"
+  ],
+  "success_rate": {"backend": "83% (15/18 pytest)", "frontend": "100% smoke — all tabs, FAB modal, plan sections, bloodwork empty state all render on mobile viewport"},
+  "seed_data_creation": "Tests created: one workout log (TEST_Bench Press, deleted in same run), one bloodwork PDF record (Vitamin D/Ferritin/Hb/TSH/glucose — deleted), one health sample for 2026-01-15 (kept — same date across iterations, upserted). Bloodwork image test failed at HTTP layer so no record was persisted for the tiny-JPEG case. Voice endpoints (silent WAV) will have created a morning_checkin + food_log entry as before (safe to leave, they're transcribed as 'you' / empty).",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Two backend fixes required from main agent before retest is meaningful: (1) plan/generate JSON truncation - raise max_tokens or shrink schema, (2) bloodwork upload-image graceful degradation on unreadable input. After main agent fixes, run `pytest /app/backend/tests/test_fitforge_api.py -v` — the failing tests will automatically pass because the schema validator is already in place. Public URL /plan/generate still 502s at ~60s so the test falls back to http://localhost:8001. If you need to see the NEW schema on the frontend, clear AsyncStorage key `fitforge_latest_plan` in devtools (or hit onboarding by wiping the plans collection) after main agent regenerates a plan. reportlab is now installed in the container.",
+  "rca_of_issue": "RCA #1 /api/plan/generate: iteration-2 expanded the plan schema (added `targets`, `meal_plan` with 2-3 options per meal, added `demo_query`/`image_query`/`muscle_group` to every exercise, added `requires_bloodwork`/`target_marker` to every supplement). The system prompt caps output at ~6000 tokens but the actual response for a 4-day training split × 5-6 exercises + 4-meal-plan × 2-3 options + 5-8 supplements + 3-month progression easily exceeds 20 KB of JSON, hitting the 6500-token stop and truncating mid-object. server.py extract_json() then raises JSONDecodeError which is caught and returned as HTTP 500 'Claude returned non-JSON. Try again.' Reproduction: `curl -sS -X POST http://localhost:8001/api/plan/generate -H 'Content-Type: application/json' -d @plan.json` -> 500 within ~60s; grep `Plan JSON parse failed` /var/log/supervisor/backend.err.log shows `Expecting ',' delimiter: line 524 column 6 (char 20790)`. Mitigation: raise max_tokens to 10000, or drop image_query field and cap meal options to 2, or split generation into two Claude calls (training+progression vs nutrition+meals+supplements+bloodpanel). RCA #2 /api/bloodwork/upload-image on 1x1 JPEG: Anthropic API rejects the request at HTTP layer with `invalid_request_error: Could not process image` before Claude runs, so the prompt's own 'return markers:[] if unreadable' clause is never reached. The endpoint's `except Exception` catches ChatError and returns generic 500. Fix: detect BadRequestError('Could not process image') and return 200 with markers:[] + suggestions.overall_summary explaining the issue."
+}

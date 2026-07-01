@@ -1,0 +1,65 @@
+{
+  "summary": "First iteration of FitForge AI tested end-to-end. Backend: 9/10 pytest cases passing (10 endpoints exercised). Only failure is POST /api/plan/generate returning HTTP 502 through the public preview gateway due to ingress timeout — backend actually completes (200 OK in backend logs) and persists the plan (proven because /api/plan/latest returns the freshly stored plan and the frontend correctly renders it). All 9 required plan sections (summary, training_split, monthly_progression, nutrition_framework, supplement_stack, blood_panel, weekly_rate_validation, injury_risk_flag, recovery_and_sleep) are present in the returned plan. Frontend: All three tabs (Plan/Today/Log) load and render correctly at EXPO_PUBLIC_BACKEND_URL on mobile viewport (390x844). Plan tab renders cached plan with SUMMARY + TRAINING SPLIT collapsible sections and exercise table (Sets/Reps/Rest columns). Today tab shows calorie card, morning check-in card, APPLE HEALTH card with the MOCKED badge and native-build warning, and food log. Log tab shows all three cards with mic + camera/gallery buttons. Voice endpoints (transcribe, checkin/morning, food/log-voice) all accepted a silent WAV multipart upload and returned 200 (Whisper + Claude extraction functioning via Emergent LLM key). Food image endpoint works with a real JPEG (Claude Vision returns structured macros); it correctly errors 500 on unprocessable 1x1 pixel input.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/plan/generate",
+        "issue": "Public preview ingress returns 502 Bad Gateway before Claude finishes (~60-75s response time). Backend itself succeeds (200 OK in backend logs, plan stored, retrievable via /api/plan/latest). Users hit the CTA, see an error toast, yet the plan is actually saved. Recommend: (a) reduce max_tokens from 8000 or shorten the system prompt so Claude replies faster, (b) return a 202 + job id + poll pattern, or (c) after generatePlan() throws, have frontend fall back to getLatestPlan() and detect a very recent created_at.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/food/log-image",
+        "issue": "Non-image / degenerate payloads (e.g. 1x1 JPEG) return raw litellm/anthropic error string in `detail`. Consider validating min image size or catching the 'Could not process image' upstream error and returning a friendlier 422 message."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Plan generation from form",
+        "issue": "Because backend response is intercepted by ingress 502 at ~60s, generatePlan() in src/api.ts throws and user sees 'Plan generation failed (502): ...' inline error. Plan IS in DB. UX should either (a) auto-retry getLatestPlan() on failure and swap to PlanView if a plan with created_at within last 3 min exists, or (b) shorten Claude latency.",
+        "affected_testIDs": ["generate-plan-button", "form-error"]
+      }
+    ],
+    "design_issues": [],
+    "react_native_issues": [
+      {
+        "component": "expo-image / ImagePicker (log.tsx)",
+        "issue": "Uses `ImagePicker.MediaTypeOptions.Images` which is deprecated in expo-image-picker >=15 in favor of the array form `mediaTypes: ['images']`. Reference: /app/frontend/app/(tabs)/log.tsx:120"
+      },
+      {
+        "component": "pointerEvents prop",
+        "issue": "Console warning at runtime: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Likely coming from a react-native-safe-area-context or Pressable child. Non-blocking but should be addressed."
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fitforge_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix plan/generate ingress 502 — either lower Claude max_tokens (e.g. 4000), tighten PLAN_SYSTEM_PROMPT so responses finish under ~45s, or make the frontend poll /api/plan/latest after a POST failure to recover the saved plan.",
+    "Replace `ImagePicker.MediaTypeOptions.Images` with `mediaTypes: ['images']` in /app/frontend/app/(tabs)/log.tsx:120 (Expo SDK deprecation).",
+    "Harden /api/food/log-image to catch litellm 'Could not process image' and return a clean 422 with a user-friendly message instead of exposing the raw Anthropic error string.",
+    "Optional: track down 'props.pointerEvents is deprecated' warning source (likely in a Pressable/Animated wrapper)."
+  ],
+  "critical_code_review_comments": [
+    "server.py: system prompt claims '8 sections' in a few places but schema and PRD require 9. Text in PLAN_SYSTEM_PROMPT says '8 sections' and generate_plan user prompt also says 'Populate ALL 8 sections' — Claude still produces all 9 keys in practice, but wording is inconsistent and should say 9.",
+    "server.py: `Field(default_factory=lambda: str(uuid.uuid4()))` and datetime defaults use naive Pydantic v1 style — fine for now but confirm requirements.txt pins pydantic<2 or migrate to model_config.",
+    "Backend logs leak full litellm exception messages in HTTP 500 `detail` fields — acceptable in dev, but sanitize before production.",
+    "PlanView cache in AsyncStorage never invalidated on backend schema changes; consider versioning the cache key."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fitforge_api.py (new)",
+    "/app/test_reports/pytest/pytest_results.xml (new)"
+  ],
+  "success_rate": {"backend": "90% (9/10 pytest)", "frontend": "100% smoke (3/3 tabs render, MOCKED badge present, all testIDs found)"},
+  "seed_data_creation": "Tests created one Plan record (via successful backend generation) and a HealthSample for 2026-01-15. Food entries created and cleaned up by delete test. A morning_checkin was created by the silent-WAV voice test (transcribed as 'you'); safe to leave.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Main blocker is the ingress 502 on /api/plan/generate — backend works but the reverse proxy in front of the preview URL kills requests longer than ~60s. Verify this again after main agent shortens the Claude response time or adds a polling-fallback in src/api.ts. Backend tests live in /app/backend/tests/test_fitforge_api.py; run with `pytest /app/backend/tests/ -v`. Real food image is downloaded from Pexels inside the test — if network to Pexels is blocked, that test will fall back to a 1x1 JPEG and fail. Frontend cached plan is stored under AsyncStorage key `fitforge_latest_plan`; clear it in devtools if you need to see the onboarding form again.",
+  "rca_of_issue": "RCA — 502 on plan/generate: Claude Sonnet 4.6 with max_tokens=8000 producing all 9 detailed sections takes ~60-75 s. Kubernetes ingress in front of the preview URL has a request-timeout below that. Backend still completes and persists (evidence: `POST /api/plan/generate HTTP/1.1 200 OK` in /var/log/supervisor/backend.out.log, plus /api/plan/latest returns the fresh plan). Reproduction: `curl -X POST https://fitforge-ai-27.preview.emergentagent.com/api/plan/generate -H 'Content-Type: application/json' -d @plan_payload.json` → 502 HTML after ~60s. Mitigation options ranked: (1) lower max_tokens to 4000 + slimmer prompt, (2) split generation into two calls, (3) 202 + polling with a jobs collection, (4) frontend fallback: on catch(), poll /api/plan/latest for 30 s looking for a plan whose created_at is newer than the request start."
+}

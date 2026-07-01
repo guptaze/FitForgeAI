@@ -1,0 +1,128 @@
+{
+  "app_name": "FitForge AI",
+  "personality": "7 Dark-First Utility DARK",
+  "personality_one_liner": "A live operational surface that feels athletic, durable, and commanding, using deep obsidian and high-contrast rust orange to spotlight dense performance data without visual noise.",
+  "color": {
+    "surface": "#121212",
+    "onSurface": "#F5F5F5",
+    "surfaceSecondary": "#1C1C1E",
+    "onSurfaceSecondary": "#E0E0E0",
+    "surfaceTertiary": "#2C2C2E",
+    "onSurfaceTertiary": "#D4D4D4",
+    "surfaceInverse": "#E0E0E0",
+    "onSurfaceInverse": "#121212",
+    "brand": "#F35900",
+    "brandPrimary": "#F35900",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#D84315",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "rgba(243, 89, 0, 0.15)",
+    "onBrandTertiary": "#F35900",
+    "success": "#00C853",
+    "onSuccess": "#FFFFFF",
+    "warning": "#FFAB00",
+    "onWarning": "#121212",
+    "error": "#D50000",
+    "onError": "#FFFFFF",
+    "info": "#00B0FF",
+    "onInfo": "#FFFFFF",
+    "border": "#333333",
+    "borderStrong": "#555555",
+    "divider": "#2A2A2A"
+  },
+  "typography": {
+    "displayFontFamily": "BebasNeue_400Regular",
+    "textFontFamily": "Manrope_500Medium",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous spacing around form cards, dense but distinct spacing within data tables. Thumb zone rules apply to primary CTAs.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "0",
+  "navigation": "stack_only",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": "false",
+    "do's": [],
+    "dont's": [
+      "No blur, no glass. This is a performance tool, not a cinematic UI. Rely on solid surfaceSecondary and 1px border dividers for clarity in dense data displays."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "none",
+      "android": "none",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "haptics": {
+    "events": {
+      "primary_cta": "impactMedium",
+      "section_collapse": "impactLight",
+      "form_input_focus": "selection",
+      "plan_generation_success": "notificationSuccess",
+      "plan_generation_error": "notificationError"
+    }
+  },
+  "screens": [
+    {
+      "name": "Onboarding Form",
+      "purpose": "A comprehensive, scrollable form to collect user metrics and preferences.",
+      "states": {
+        "loading": "Centered simple spinner tinted brandPrimary with 'Forging plan...' text.",
+        "empty": "Not applicable (form is static).",
+        "error": "Inline red text below the submit button."
+      },
+      "layout": "Vertical scrolling card system. Top of the screen features a hero_background image mapped to a 3-stop vertical gradient scrim (transparent to surface). Form inputs are grouped into thematic cards (Body, Timeline, Training, Diet, Injuries, Goals) using surfaceSecondary, md margin, sm radius, 1px solid border. Labels above inputs. Input backgrounds are surfaceTertiary. The 'Generate Plan' primary CTA is pinned to the bottom (thumb zone) outside the scrolling content, fully opaque surface background."
+    },
+    {
+      "name": "Plan Display",
+      "purpose": "Dense information display of the generated 8-section plan.",
+      "states": {
+        "loading": "Simple ActivityIndicator spinner centered on surface.",
+        "empty": "Not applicable.",
+        "error": "Inline text with 'Retry' button if Claude API fails."
+      },
+      "layout": "Single view accessed via stack navigation. Uses collapsible section headers for each of the 8 plan sections. Headers have a large bold title (Bebas Neue) and a chevron. The 'Training Split' section uses a clean grid table with 1px border dividers and alternating surface/surfaceTertiary rows. Typography inside the table is condensed to save space. 'Regenerate' option is available via a secondary CTA or header button."
+    }
+  ],
+  "images": {
+    "hero_background": {
+      "url": "https://images.pexels.com/photos/6800730/pexels-photo-6800730.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "dark abstract seamless geometric abstraction"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Design follows the 7 Dark-First Utility DARK personality. Ensure high contrast and strict adherence to the specified dark palette.",
+    "Form inputs must be wrapped in cards with 1px borders and slight rounding (sm: 6) to segment the long form effectively. Labels must be strictly above inputs.",
+    "Do NOT use glassmorphism. Stick to solid colors (surfaceSecondary/surfaceTertiary) to maintain the athletic, utility-focused vibe.",
+    "The hero_background image on the form screen MUST include the mandated 3-stop vertical gradient scrim (transparent -> rgba(18,18,18,0.7) -> #121212) so text overlay remains 100% readable.",
+    "Pin the main Generate CTA to the bottom of the form screen, outside of the ScrollView, so the user doesn't have to scroll all the way down to submit.",
+    "Use Bebas Neue for all section headers and numeric focal points, and Manrope for body text and form inputs.",
+    "Ensure the Training Split table is highly compact, utilizing 1px borders for grid lines, keeping it feeling like a coach's spreadsheet.",
+    "Include haptics on form submission, section expand/collapse, and success states.",
+    "Keep the loading state extremely simple: a raw spinner (no skeletons), matching the user's explicit request."
+  ]
+}
