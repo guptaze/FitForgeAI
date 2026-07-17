@@ -219,7 +219,10 @@ async def call_claude_json(
         messages=[{"role": "user", "content": content}],
     )
 
-    return extract_json(response.content[0].text)
+    text_block = next((block.text for block in response.content if getattr(block, "type", None) == "text"), None)
+    if text_block is None:
+        raise ValueError("No text content block found in Claude response")
+    return extract_json(text_block)
 
 
 async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.m4a", mime: str = "audio/m4a") -> str:
