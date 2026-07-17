@@ -173,8 +173,11 @@ PLAN_SYSTEM_PROMPT = """You are an elite S&C coach and registered dietitian. Ret
 
 - summary (string, 3-4 sentences)
 - targets: { start_weight_kg:number, target_weight_kg:number, duration_months:int, weekly_rate_kg:number }
-- training_split: { structure:string, table:[ { day:string, focus:string, exercises:[ { name, sets, reps, rest, notes, demo_query:string, image_query:string, muscle_group:string } ] } ] }
-  demo_query is a YouTube search string like "barbell back squat proper form". image_query is 2-3 words like "barbell squat". muscle_group ∈ {chest,back,legs,shoulders,arms,core,cardio}.
+- training_split: { structure:string, table:[ { day:string, focus:string, is_rest_day:boolean, water_intake_ml:int, recovery_recommendations:[ { name, description } ], exercises:[ { name, exercise_type:"warmup"|"strength"|"cardio"|"cooldown", sets, reps, rest_between_sets_seconds:int, notes, demo_query:string, image_query:string, muscle_group:string } ] } ] }
+  demo_query is a YouTube search string like "barbell back squat proper form" — a search string only, never a direct video URL. image_query is 2-3 words like "barbell squat". muscle_group ∈ {chest,back,legs,shoulders,arms,core,cardio}.
+  On training days (is_rest_day=false): exercises MUST start with exactly 1 warmup entry, end with exactly 1 cardio or cooldown entry, with strength exercises in between. rest_between_sets_seconds must be a realistic number per exercise (e.g. 60-90 for strength, 0 for warmup/cardio). recovery_recommendations must be an empty array.
+  On rest/recovery days (is_rest_day=true): exercises MUST be an empty array. recovery_recommendations must contain 2-3 very low-effort options (e.g. short walk, light stretching, foam rolling), each with a one-sentence description.
+  water_intake_ml must be a realistic integer for that day (higher for training days, e.g. 500-1000; lower for rest days, e.g. 250-500).
 - monthly_progression: [ { month:int, focus, weight_target_kg:number, volume_notes, intensity_notes } ]
 - nutrition_framework: { daily_calories:int, protein_g:int, carbs_g:int, fat_g:int, meal_structure, cheat_day_rule, hydration_l:number }
 - meal_plan: [ { meal:string (e.g. "Breakfast"), time_window:string, target_calories:int, target_protein_g:int, options:[ { name, description, calories:int, protein_g:int, carbs_g:int, fat_g:int, prep_time_min:int } ] } ]  provide EXACTLY 2 options per meal, respecting diet_type
@@ -184,7 +187,7 @@ PLAN_SYSTEM_PROMPT = """You are an elite S&C coach and registered dietitian. Ret
 - injury_risk_flag: { level:"low"|"moderate"|"high", concerns:[string], movements_to_avoid:[string], substitutions:[{avoid,use}] }
 - recovery_and_sleep: { sleep_target_hours:number, recovery_protocols:[string], deload_frequency }
 
-Rules: JSON only, no markdown, no preamble. Populate every key. Keep output under ~6000 tokens."""
+Rules: JSON only, no markdown, no preamble. Populate every key. Keep output under ~9000 tokens."""
 
 
 async def call_claude_json(
