@@ -77,11 +77,13 @@ class Diet(BaseModel):
     diet_type: str
     meal_pattern: str
     cheat_day_policy: str
+    meals_per_day: Optional[int] = None
 
 class Goals(BaseModel):
     aesthetic_goal: str
     focus_muscles: List[str]
     pace: str
+    goal_tags: List[str] = []
 
 class UserProfile(BaseModel):
     name: str
@@ -114,6 +116,14 @@ class MorningCheckin(BaseModel):
     weight_kg: Optional[float] = None
     bowel_movement: Optional[str] = None
     sleep_quality: Optional[str] = None
+
+
+class ManualCheckin(BaseModel):
+    weight_kg: Optional[float] = None
+    bowel_movement: Optional[str] = None
+    sleep_quality: Optional[str] = None
+    energy: Optional[int] = None
+    soreness: Optional[str] = None
 
 
 class FoodEntry(BaseModel):
@@ -173,6 +183,20 @@ class WorkoutLog(BaseModel):
     reps: str
     weight_kg: Optional[float] = None
     notes: Optional[str] = None
+
+
+class SessionSet(BaseModel):
+    r: Optional[int] = None  # reps
+    w: Optional[float] = None  # weight kg
+
+class SessionExercise(BaseModel):
+    name: str
+    equipment: Optional[str] = None
+    sets: List[SessionSet] = []
+
+class WorkoutSessionInput(BaseModel):
+    session: str
+    exercises: List[SessionExercise]
 
 
 class BloodworkRecord(BaseModel):
@@ -275,17 +299,46 @@ async def get_profile():
     return doc or {}
 
 
+NONVEG_KEYWORDS = [
+    "chicken", "beef", "pork", "lamb", "mutton", "fish", "salmon", "tuna", "shrimp",
+    "prawn", "crab", "turkey", "bacon", "ham", "meat", "seafood", "anchovy", "sausage", "gelatin",
+]
+VEGAN_EXTRA_KEYWORDS = ["egg", "milk", "cheese", "yogurt", "yoghurt", "paneer", "butter", "ghee", "honey", "cream", "whey"]
+
+def find_diet_violations(plan_json: Dict[str, Any], diet_type: str) -> List[str]:
+    dt = (diet_type or "").lower()
+    if "vegan" in dt:
+        banned = NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS
+    elif "eggetarian" in dt:
+        banned = NONVEG_KEYWORDS
+    elif "vegetarian" in dt:
+        banned = NONVEG_KEYWORDS + ["egg"]
+    else:
+        return []
+    violations = []
+    for meal in plan_json.get("meal_plan", []):
+        for opt in meal.get("options", []):
+            text = f"{opt.get('name','')} {opt.get('description','')}".lower()
+            hit = next((k for k in banned if k in text), None)
+            if hit:
+                violations.append(f"{meal.get('meal','?')}: '{opt.get('name','?')}' (contains '{hit}')")
+    return violations
+
+
 @api_router.post("/plan/generate")
 async def generate_plan(payload: PlanInput):
     try:
+        meals_line = f", meals_per_day: {payload.diet.meals_per_day}" if payload.diet.meals_per_day else ""
+        goals_line = f", goal_tags: {', '.join(payload.goals.goal_tags)}" if payload.goals.goal_tags else ""
+
         user_prompt = f"""Generate a full fat-loss + strength plan. Return valid JSON only per system schema.
 
 BODY: {payload.body.current_weight_kg} kg -> {payload.body.target_weight_kg} kg, height {payload.body.height_cm} cm, age {payload.body.age}, sex {payload.body.sex}
 TIMELINE: {payload.duration_months} months
 TRAINING: {payload.training.days_per_week} days/wk, {payload.training.minutes_per_session} min/session, window: {payload.training.preferred_window}
-DIET: type {payload.diet.diet_type}, pattern "{payload.diet.meal_pattern}", cheat: "{payload.diet.cheat_day_policy}"
+DIET: type {payload.diet.diet_type}, pattern "{payload.diet.meal_pattern}", cheat: "{payload.diet.cheat_day_policy}"{meals_line}
 INJURIES: {payload.injuries or 'None'}
-GOALS: {payload.goals.aesthetic_goal}, focus {', '.join(payload.goals.focus_muscles)}, pace {payload.goals.pace}
+GOALS: {payload.goals.aesthetic_goal}, focus {', '.join(payload.goals.focus_muscles)}, pace {payload.goals.pace}{goals_line}
 SCHEDULE: {payload.daily_schedule}
 
 For every exercise include demo_query (YouTube search string) and image_query (2-3 words for stock image). Provide 2-3 options per meal in meal_plan respecting diet_type. Mark supplements that depend on bloodwork with requires_bloodwork=true and target_marker (e.g. "vitamin_d","ferritin","testosterone")."""
@@ -301,6 +354,38 @@ For every exercise include demo_query (YouTube search string) and image_query (2
                 PLAN_SYSTEM_PROMPT, user_prompt,
                 session_id=f"plan-retry-{uuid.uuid4()}", max_tokens=16000,
             )
+
+        # Deterministic diet-compliance safety net — don't rely on the prompt alone for a
+        # health/allergy-adjacent correctness issue.
+        violations = find_diet_violations(plan_json, payload.diet.diet_type)
+        if violations:
+            logger.warning(f"Diet violations found, retrying with correction: {violations}")
+            correction_prompt = user_prompt + (
+                f"\n\nYour previous attempt incorrectly included these non-compliant items: "
+                f"{'; '.join(violations)}. Regenerate the ENTIRE plan, making sure every single "
+                f"meal_plan option strictly complies with diet_type={payload.diet.diet_type}."
+            )
+            plan_json = await call_claude_json(
+                PLAN_SYSTEM_PROMPT, correction_prompt,
+                session_id=f"plan-dietfix-{uuid.uuid4()}", max_tokens=16000,
+            )
+            violations = find_diet_violations(plan_json, payload.diet.diet_type)
+            if violations:
+                # Last resort: strip non-compliant options rather than serve them.
+                logger.warning(f"Diet violations persisted after retry, filtering: {violations}")
+                for meal in plan_json.get("meal_plan", []):
+                    dt = (payload.diet.diet_type or "").lower()
+                    banned = (
+                        NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS if "vegan" in dt
+                        else NONVEG_KEYWORDS if "eggetarian" in dt
+                        else NONVEG_KEYWORDS + ["egg"] if "vegetarian" in dt
+                        else []
+                    )
+                    if banned:
+                        meal["options"] = [
+                            o for o in meal.get("options", [])
+                            if not any(k in f"{o.get('name','')} {o.get('description','')}".lower() for k in banned)
+                        ] or meal.get("options", [])[:1]
 
         record = PlanRecord(input=payload.dict(), plan=plan_json)
         await db.plans.insert_one(record.dict())
@@ -361,6 +446,26 @@ async def morning_checkin(file: UploadFile = File(...)):
     except Exception:
         logger.exception("Morning checkin failed")
         raise HTTPException(status_code=500, detail="Check-in analysis failed.")
+
+
+@api_router.post("/checkin/manual")
+async def manual_checkin(payload: ManualCheckin):
+    """Non-voice, tap-log check-in. Writes to the same `checkins` collection as the
+    voice path so /api/overview's latest-weight logic picks it up automatically."""
+    entry = {
+        "id": str(uuid.uuid4()),
+        "date": today_key(),
+        "created_at": utcnow_iso(),
+        "transcript": None,
+        "weight_kg": payload.weight_kg,
+        "bowel_movement": payload.bowel_movement,
+        "sleep_quality": payload.sleep_quality,
+        "energy": payload.energy,
+        "soreness": payload.soreness,
+    }
+    await db.checkins.insert_one(entry)
+    entry.pop("_id", None)
+    return entry
 
 
 FOOD_TEXT_PROMPT = """Dietitian. From food description, estimate calories/macros. Return ONLY JSON:
@@ -512,6 +617,33 @@ async def log_workout(payload: WorkoutLog):
     doc.pop("_id", None)
     return doc
 
+@api_router.post("/workouts/log-session")
+async def log_workout_session(payload: WorkoutSessionInput):
+    """Logs a full workout session (multiple exercises, each with its own sets) in one call.
+    Writes one workout_logs document per exercise so existing /workouts/today and
+    /workouts/history endpoints keep working unchanged."""
+    date = today_key()
+    saved = []
+    for ex in payload.exercises:
+        sets_done = len(ex.sets)
+        reps_str = ",".join(str(s.r) for s in ex.sets if s.r is not None)
+        weight_kg = next((s.w for s in reversed(ex.sets) if s.w is not None), None)
+        doc = {
+            "id": str(uuid.uuid4()),
+            "date": date,
+            "created_at": utcnow_iso(),
+            "day_label": payload.session,
+            "exercise_name": ex.name,
+            "sets_done": sets_done,
+            "reps": reps_str,
+            "weight_kg": weight_kg,
+            "notes": ex.equipment,
+        }
+        await db.workout_logs.insert_one(doc)
+        doc.pop("_id", None)
+        saved.append(doc)
+    return {"date": date, "session": payload.session, "logged": saved}
+
 @api_router.get("/workouts/today")
 async def workouts_today():
     date = today_key()
@@ -535,6 +667,7 @@ BLOODWORK_PROMPT = """You are a physician analysing a blood test report. Extract
 Return ONLY valid JSON with this exact schema:
 {
   "markers": [ { "name":string, "value":number|string, "unit":string, "reference_range":string|null, "flag":"low"|"normal"|"high"|"unknown" } ],
+  "summary": { "normal_count":int, "flagged_count":int, "unknown_count":int },
   "abnormal_findings": [ { "marker":string, "finding":string, "clinical_significance":string } ],
   "supplement_recommendations": [
     { "name":string, "dose":string, "timing":string, "rationale":string, "based_on_marker":string, "priority":"high"|"medium"|"low" }
@@ -545,7 +678,11 @@ Return ONLY valid JSON with this exact schema:
   "flags_for_doctor": [ string ],
   "overall_summary": string
 }
-Ground every recommendation in a specific marker reading. If report unclear or unreadable, return markers:[] and set overall_summary explaining what you couldn't parse."""
+CRITICAL flagging rules — do not skip this step:
+1. reference_range must be copied verbatim from the source report for every marker where a range is printed. Never leave it null if the report shows one.
+2. For every marker, explicitly compare its numeric value against the low/high bounds of its reference_range before assigning flag. A value below the low bound is "low", above the high bound is "high", within bounds is "normal". Only use "unknown" if the report genuinely provides no reference range to compare against — never default to "normal" without actually performing this comparison.
+3. summary must be computed by counting the actual flags in the markers array (normal_count = markers with flag "normal", flagged_count = markers with flag "high" or "low", unknown_count = markers with flag "unknown"). These numbers must be internally consistent with the markers list — never guess or leave at zero if markers exist.
+Ground every recommendation in a specific marker reading. If report unclear or unreadable, return markers:[], summary with all zeros, and set overall_summary explaining what you couldn't parse."""
 
 
 @api_router.post("/bloodwork/upload-image")
