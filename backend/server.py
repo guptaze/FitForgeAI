@@ -204,7 +204,7 @@ PLAN_SYSTEM_PROMPT = """You are an elite S&C coach and registered dietitian. Ret
 - injury_risk_flag: { level:"low"|"moderate"|"high", concerns:[string], movements_to_avoid:[string], substitutions:[{avoid,use}] }
 - recovery_and_sleep: { sleep_target_hours:number, recovery_protocols:[string], deload_frequency }
 
-Rules: JSON only, no markdown, no preamble. Populate every key. Keep output under ~9000 tokens."""
+Rules: JSON only, no markdown, no preamble. Populate every key. Keep output under ~13000 tokens."""
 
 
 async def call_claude_json(
@@ -290,7 +290,17 @@ SCHEDULE: {payload.daily_schedule}
 
 For every exercise include demo_query (YouTube search string) and image_query (2-3 words for stock image). Provide 2-3 options per meal in meal_plan respecting diet_type. Mark supplements that depend on bloodwork with requires_bloodwork=true and target_marker (e.g. "vitamin_d","ferritin","testosterone")."""
 
-        plan_json = await call_claude_json(PLAN_SYSTEM_PROMPT, user_prompt, session_id=f"plan-{uuid.uuid4()}")
+        try:
+            plan_json = await call_claude_json(
+                PLAN_SYSTEM_PROMPT, user_prompt,
+                session_id=f"plan-{uuid.uuid4()}", max_tokens=16000,
+            )
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Plan JSON parse failed on first attempt, retrying once")
+            plan_json = await call_claude_json(
+                PLAN_SYSTEM_PROMPT, user_prompt,
+                session_id=f"plan-retry-{uuid.uuid4()}", max_tokens=16000,
+            )
 
         record = PlanRecord(input=payload.dict(), plan=plan_json)
         await db.plans.insert_one(record.dict())
@@ -298,8 +308,8 @@ For every exercise include demo_query (YouTube search string) and image_query (2
     except HTTPException:
         raise
     except json.JSONDecodeError:
-        logger.exception("Plan JSON parse failed")
-        raise HTTPException(status_code=500, detail="Claude returned non-JSON. Try again.")
+        logger.exception("Plan JSON parse failed after retry")
+        raise HTTPException(status_code=500, detail="Claude returned non-JSON twice. Try again.")
     except Exception:
         logger.exception("Plan generation failed")
         raise HTTPException(status_code=500, detail="Plan generation failed.")
