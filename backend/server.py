@@ -305,21 +305,31 @@ NONVEG_KEYWORDS = [
 ]
 VEGAN_EXTRA_KEYWORDS = ["egg", "milk", "cheese", "yogurt", "yoghurt", "paneer", "butter", "ghee", "honey", "cream", "whey"]
 
-def find_diet_violations(plan_json: Dict[str, Any], diet_type: str) -> List[str]:
+def banned_keywords_for_diet(diet_type: str) -> List[str]:
     dt = (diet_type or "").lower()
     if "vegan" in dt:
-        banned = NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS
-    elif "eggetarian" in dt:
-        banned = NONVEG_KEYWORDS
-    elif "vegetarian" in dt:
-        banned = NONVEG_KEYWORDS + ["egg"]
-    else:
+        return NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS
+    if "eggetarian" in dt:
+        return NONVEG_KEYWORDS
+    if "vegetarian" in dt:
+        return NONVEG_KEYWORDS + ["egg"]
+    return []
+
+def text_violates_diet(name: str, description: str, diet_type: str) -> Optional[str]:
+    banned = banned_keywords_for_diet(diet_type)
+    if not banned:
+        return None
+    text = f"{name or ''} {description or ''}".lower()
+    return next((k for k in banned if k in text), None)
+
+def find_diet_violations(plan_json: Dict[str, Any], diet_type: str) -> List[str]:
+    banned = banned_keywords_for_diet(diet_type)
+    if not banned:
         return []
     violations = []
     for meal in plan_json.get("meal_plan", []):
         for opt in meal.get("options", []):
-            text = f"{opt.get('name','')} {opt.get('description','')}".lower()
-            hit = next((k for k in banned if k in text), None)
+            hit = text_violates_diet(opt.get("name", ""), opt.get("description", ""), diet_type)
             if hit:
                 violations.append(f"{meal.get('meal','?')}: '{opt.get('name','?')}' (contains '{hit}')")
     return violations
@@ -373,18 +383,12 @@ For every exercise include demo_query (YouTube search string) and image_query (2
             if violations:
                 # Last resort: strip non-compliant options rather than serve them.
                 logger.warning(f"Diet violations persisted after retry, filtering: {violations}")
-                for meal in plan_json.get("meal_plan", []):
-                    dt = (payload.diet.diet_type or "").lower()
-                    banned = (
-                        NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS if "vegan" in dt
-                        else NONVEG_KEYWORDS if "eggetarian" in dt
-                        else NONVEG_KEYWORDS + ["egg"] if "vegetarian" in dt
-                        else []
-                    )
-                    if banned:
+                banned = banned_keywords_for_diet(payload.diet.diet_type)
+                if banned:
+                    for meal in plan_json.get("meal_plan", []):
                         meal["options"] = [
                             o for o in meal.get("options", [])
-                            if not any(k in f"{o.get('name','')} {o.get('description','')}".lower() for k in banned)
+                            if not text_violates_diet(o.get("name", ""), o.get("description", ""), payload.diet.diet_type)
                         ] or meal.get("options", [])[:1]
 
         record = PlanRecord(input=payload.dict(), plan=plan_json)
@@ -788,6 +792,19 @@ async def kitchen_suggest(payload: KitchenSuggestInput):
             KITCHEN_SUGGEST_PROMPT, user_prompt,
             session_id=f"kitchen-{uuid.uuid4()}", max_tokens=1500,
         )
+
+        hit = text_violates_diet(result.get("name", ""), result.get("description", ""), diet_type)
+        if hit:
+            logger.warning(f"Kitchen suggestion violated diet ({hit}), retrying")
+            correction_prompt = user_prompt + (
+                f"\n\nYour previous suggestion incorrectly contained '{hit}', which violates diet type "
+                f"{diet_type}. Suggest a different recipe that strictly complies."
+            )
+            result = await call_claude_json(
+                KITCHEN_SUGGEST_PROMPT, correction_prompt,
+                session_id=f"kitchen-dietfix-{uuid.uuid4()}", max_tokens=1500,
+            )
+
         return result
     except HTTPException:
         raise
