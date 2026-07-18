@@ -130,6 +130,17 @@ class FoodEntry(BaseModel):
     notes: Optional[str] = None
 
 
+class KitchenSuggestInput(BaseModel):
+    items: List[str]
+
+
+class SupplementLog(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    date: str = Field(default_factory=today_key)
+    created_at: str = Field(default_factory=utcnow_iso)
+    supplement_name: str
+
+
 class HealthSample(BaseModel):
     date: str
     steps: int = 0
@@ -347,6 +358,10 @@ FOOD_TEXT_PROMPT = """Dietitian. From food description, estimate calories/macros
 
 FOOD_IMAGE_PROMPT = """Dietitian analyzing a food photo. Identify visible items and estimate calories/macros. Return ONLY JSON:
 { "food_items":[string], "estimated_calories":int, "protein_g":number, "carbs_g":number, "fat_g":number, "notes":string }"""
+
+KITCHEN_SUGGEST_PROMPT = """You are a dietitian. Given a list of ingredients the user currently has on hand and their daily nutrition targets, suggest ONE recipe that primarily uses those on-hand ingredients. Return ONLY JSON:
+{ "name":string, "description":string, "calories":int, "protein_g":number, "carbs_g":number, "fat_g":number, "prep_time_min":int, "ingredients_used":[string], "ingredients_needed":[string], "steps":[string] }
+ingredients_used must be a subset of the provided items that this recipe actually uses. ingredients_needed lists any additional common pantry items required that were NOT in the provided list (keep this short). steps should be 4-8 concise instructions."""
 
 
 @api_router.post("/food/log-voice")
@@ -604,6 +619,51 @@ async def bloodwork_latest():
 @api_router.delete("/bloodwork/{record_id}")
 async def bloodwork_delete(record_id: str):
     res = await db.bloodwork.delete_one({"id": record_id})
+    return {"deleted": res.deleted_count}
+
+
+# ------ Kitchen-based recipe suggestion ------
+
+@api_router.post("/nutrition/kitchen-suggest")
+async def kitchen_suggest(payload: KitchenSuggestInput):
+    try:
+        plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+        nutri = (plan_doc or {}).get("plan", {}).get("nutrition_framework", {})
+        user_prompt = (
+            f"Ingredients on hand: {', '.join(payload.items) if payload.items else 'none listed'}\n"
+            f"User's daily nutrition targets: {json.dumps(nutri)}\n"
+            "Suggest one recipe using mostly these ingredients."
+        )
+        result = await call_claude_json(
+            KITCHEN_SUGGEST_PROMPT, user_prompt,
+            session_id=f"kitchen-{uuid.uuid4()}", max_tokens=1500,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Kitchen suggest failed")
+        raise HTTPException(status_code=500, detail="Could not generate a kitchen-based suggestion.")
+
+
+# ------ Supplement logging ------
+
+@api_router.post("/supplements/log")
+async def log_supplement(payload: SupplementLog):
+    doc = payload.dict()
+    await db.supplement_logs.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/supplements/today")
+async def supplements_today():
+    date = today_key()
+    logs = await db.supplement_logs.find({"date": date}, {"_id": 0}).to_list(100)
+    return {"date": date, "taken": [l["supplement_name"] for l in logs], "logs": logs}
+
+@api_router.delete("/supplements/{log_id}")
+async def delete_supplement_log(log_id: str):
+    res = await db.supplement_logs.delete_one({"id": log_id})
     return {"deleted": res.deleted_count}
 
 
