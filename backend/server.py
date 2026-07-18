@@ -197,7 +197,7 @@ PLAN_SYSTEM_PROMPT = """You are an elite S&C coach and registered dietitian. Ret
   water_intake_ml must be a realistic integer for that day (higher for training days, e.g. 500-1000; lower for rest days, e.g. 250-500).
 - monthly_progression: [ { month:int, focus, weight_target_kg:number, volume_notes, intensity_notes } ]
 - nutrition_framework: { daily_calories:int, protein_g:int, carbs_g:int, fat_g:int, meal_structure, cheat_day_rule, hydration_l:number }
-- meal_plan: [ { meal:string (e.g. "Breakfast"), time_window:string, target_calories:int, target_protein_g:int, options:[ { name, description, calories:int, protein_g:int, carbs_g:int, fat_g:int, prep_time_min:int } ] } ]  provide EXACTLY 2 options per meal, respecting diet_type
+- meal_plan: [ { meal:string (e.g. "Breakfast"), time_window:string, target_calories:int, target_protein_g:int, options:[ { name, description, calories:int, protein_g:int, carbs_g:int, fat_g:int, prep_time_min:int } ] } ]  provide EXACTLY 2 options per meal. HARD CONSTRAINT: every single option must strictly comply with the user's stated diet_type — if vegetarian, NEVER include meat, poultry, fish, or seafood in any option; if vegan, NEVER include any animal product including dairy, eggs, or honey; if eggetarian, eggs are fine but no meat/fish/poultry. This is non-negotiable regardless of other goals.
 - supplement_stack: [ { name, dose, timing, purpose, priority:"core"|"situational", requires_bloodwork:boolean, target_marker:string|null } ]  mark supplements that depend on bloodwork readings (e.g. Vit D3 -> "vitamin_d")
 - blood_panel: { recommended_tests:[string], frequency, flags_to_watch:[string], why_it_matters:string }
 - weekly_rate_validation: { target_weekly_loss_kg:number, safe_range_kg:string, verdict:"safe"|"aggressive"|"unrealistic", explanation }
@@ -369,9 +369,10 @@ FOOD_TEXT_PROMPT = """Dietitian. From food description, estimate calories/macros
 FOOD_IMAGE_PROMPT = """Dietitian analyzing a food photo. Identify visible items and estimate calories/macros. Return ONLY JSON:
 { "food_items":[string], "estimated_calories":int, "protein_g":number, "carbs_g":number, "fat_g":number, "notes":string }"""
 
-KITCHEN_SUGGEST_PROMPT = """You are a dietitian. Given a list of ingredients the user currently has on hand and their daily nutrition targets, suggest ONE recipe that primarily uses those on-hand ingredients. Return ONLY JSON:
+KITCHEN_SUGGEST_PROMPT = """You are a dietitian. Given a list of ingredients the user currently has on hand, their diet type, and their daily nutrition targets, suggest ONE recipe that primarily uses those on-hand ingredients. Return ONLY JSON:
 { "name":string, "description":string, "calories":int, "protein_g":number, "carbs_g":number, "fat_g":number, "prep_time_min":int, "ingredients_used":[string], "ingredients_needed":[string], "steps":[string] }
-ingredients_used must be a subset of the provided items that this recipe actually uses. ingredients_needed lists any additional common pantry items required that were NOT in the provided list (keep this short). steps should be 4-8 concise instructions."""
+ingredients_used must be a subset of the provided items that this recipe actually uses. ingredients_needed lists any additional common pantry items required that were NOT in the provided list (keep this short). steps should be 4-8 concise instructions.
+HARD CONSTRAINT: the recipe must strictly comply with the user's stated diet type — if vegetarian, NEVER include meat, poultry, fish, or seafood; if vegan, NEVER include any animal product; if eggetarian, eggs are fine but no meat/fish/poultry. This is non-negotiable."""
 
 
 @api_router.post("/food/log-voice")
@@ -639,10 +640,12 @@ async def kitchen_suggest(payload: KitchenSuggestInput):
     try:
         plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
         nutri = (plan_doc or {}).get("plan", {}).get("nutrition_framework", {})
+        diet_type = (plan_doc or {}).get("input", {}).get("diet", {}).get("diet_type", "no restriction stated")
         user_prompt = (
             f"Ingredients on hand: {', '.join(payload.items) if payload.items else 'none listed'}\n"
+            f"User's diet type (MUST strictly follow): {diet_type}\n"
             f"User's daily nutrition targets: {json.dumps(nutri)}\n"
-            "Suggest one recipe using mostly these ingredients."
+            "Suggest one recipe using mostly these ingredients, strictly respecting the diet type above."
         )
         result = await call_claude_json(
             KITCHEN_SUGGEST_PROMPT, user_prompt,
