@@ -83,6 +83,12 @@ class Goals(BaseModel):
     focus_muscles: List[str]
     pace: str
 
+class UserProfile(BaseModel):
+    name: str
+    email: str
+    phone: Optional[str] = None
+    updated_at: str = Field(default_factory=utcnow_iso)
+
 class PlanInput(BaseModel):
     body: BodyMetrics
     duration_months: int
@@ -244,6 +250,18 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.m4a", mime
 @api_router.get("/")
 async def root():
     return {"app": "FitForge AI", "status": "ok"}
+
+
+@api_router.post("/profile")
+async def save_profile(payload: UserProfile):
+    doc = payload.dict()
+    await db.profile.update_one({}, {"$set": doc}, upsert=True)
+    return doc
+
+@api_router.get("/profile")
+async def get_profile():
+    doc = await db.profile.find_one({}, {"_id": 0})
+    return doc or {}
 
 
 @api_router.post("/plan/generate")
