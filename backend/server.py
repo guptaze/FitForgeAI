@@ -16,6 +16,9 @@ import anthropic
 from openai import AsyncOpenAI
 from pypdf import PdfReader
 import certifi
+from pywebpush import webpush, WebPushException
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -25,6 +28,9 @@ DB_NAME = os.environ['DB_NAME']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']          # replaces EMERGENT_LLM_KEY
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5')
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
+VAPID_CONTACT_EMAIL = os.environ.get('VAPID_CONTACT_EMAIL', 'mailto:admin@fitforgeai.app')
 
 mongo_client = AsyncIOMotorClient(MONGO_URL, tls=True, tlsCAFile=certifi.where())
 db = mongo_client[DB_NAME]
@@ -221,7 +227,7 @@ PLAN_SYSTEM_PROMPT = """You are an elite S&C coach and registered dietitian. Ret
   water_intake_ml must be a realistic integer for that day (higher for training days, e.g. 500-1000; lower for rest days, e.g. 250-500).
 - monthly_progression: [ { month:int, focus, weight_target_kg:number, volume_notes, intensity_notes } ]
 - nutrition_framework: { daily_calories:int, protein_g:int, carbs_g:int, fat_g:int, meal_structure, cheat_day_rule, hydration_l:number }
-- meal_plan: [ { meal:string (e.g. "Breakfast"), time_window:string, target_calories:int, target_protein_g:int, options:[ { name, description, calories:int, protein_g:int, carbs_g:int, fat_g:int, prep_time_min:int } ] } ]  provide EXACTLY 2 options per meal. HARD CONSTRAINT: every single option must strictly comply with the user's stated diet_type — if vegetarian, NEVER include meat, poultry, fish, or seafood in any option; if vegan, NEVER include any animal product including dairy, eggs, or honey; if eggetarian, eggs are fine but no meat/fish/poultry. This is non-negotiable regardless of other goals.
+- meal_plan: [ { meal:string (e.g. "Breakfast"), time_window:string, target_calories:int, target_protein_g:int, options:[ { name, description, calories:int, protein_g:int, carbs_g:int, fat_g:int, prep_time_min:int, common_substitutions:string } ] } ]  provide 4 distinct options per meal (varied cuisines/prep styles, not near-duplicates), each with a common_substitutions note (1 short sentence on an easy swap, e.g. "swap paneer for tofu for a lighter version"). HARD CONSTRAINT: every single option must strictly comply with the user's stated diet_type — if vegetarian, NEVER include meat, poultry, fish, or seafood in any option; if vegan, NEVER include any animal product including dairy, eggs, or honey; if eggetarian, eggs are fine but no meat/fish/poultry. This is non-negotiable regardless of other goals.
 - supplement_stack: [ { name, dose, timing, purpose, priority:"core"|"situational", requires_bloodwork:boolean, target_marker:string|null } ]  mark supplements that depend on bloodwork readings (e.g. Vit D3 -> "vitamin_d")
 - blood_panel: { recommended_tests:[string], frequency, flags_to_watch:[string], why_it_matters:string }
 - weekly_rate_validation: { target_weekly_loss_kg:number, safe_range_kg:string, verdict:"safe"|"aggressive"|"unrealistic", explanation }
@@ -834,12 +840,126 @@ async def delete_supplement_log(log_id: str):
     return {"deleted": res.deleted_count}
 
 
+# ------ Push notifications ------
+
+class PushSubscription(BaseModel):
+    endpoint: str
+    keys: Dict[str, str]  # {"p256dh": "...", "auth": "..."}
+
+@api_router.get("/push/vapid-public-key")
+async def push_public_key():
+    return {"publicKey": VAPID_PUBLIC_KEY}
+
+@api_router.post("/push/subscribe")
+async def push_subscribe(payload: PushSubscription):
+    doc = payload.dict()
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = utcnow_iso()
+    # One subscription per endpoint (avoids duplicates if the same device re-subscribes)
+    await db.push_subscriptions.update_one(
+        {"endpoint": payload.endpoint}, {"$set": doc}, upsert=True
+    )
+    return {"subscribed": True}
+
+@api_router.delete("/push/unsubscribe")
+async def push_unsubscribe(payload: PushSubscription):
+    res = await db.push_subscriptions.delete_one({"endpoint": payload.endpoint})
+    return {"deleted": res.deleted_count}
+
+
+async def send_push_to_all(title: str, body: str, url: str = "/"):
+    if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+        logger.warning("Push notification skipped: VAPID keys not configured")
+        return
+    subs = await db.push_subscriptions.find({}, {"_id": 0}).to_list(200)
+    payload = json.dumps({"title": title, "body": body, "url": url})
+    for sub in subs:
+        try:
+            webpush(
+                subscription_info={"endpoint": sub["endpoint"], "keys": sub["keys"]},
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_CONTACT_EMAIL},
+            )
+        except WebPushException as e:
+            logger.warning(f"Push failed for one subscription, removing it: {e}")
+            # Dead/expired subscription — clean it up so it stops being retried daily.
+            await db.push_subscriptions.delete_one({"endpoint": sub["endpoint"]})
+        except Exception:
+            logger.exception("Unexpected push error")
+
+@api_router.post("/push/test")
+async def push_test():
+    """Manual trigger to verify push notifications actually work end to end."""
+    await send_push_to_all("FitForgeAI", "Test notification — if you see this, push works.", "/")
+    return {"sent": True}
+
+
+async def morning_sleep_reminder():
+    await send_push_to_all(
+        "Good morning ☀️",
+        "How did you sleep? Tap to log in one second.",
+        "/log?quick=sleep",
+    )
+
+async def evening_supplement_reminder():
+    await send_push_to_all(
+        "Wind-down check 🌙",
+        "Taken your evening supplements yet?",
+        "/log?quick=supplements",
+    )
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(morning_sleep_reminder, CronTrigger(hour=7, minute=30))
+scheduler.add_job(evening_supplement_reminder, CronTrigger(hour=21, minute=30))
+
+
+# ------ Smart training recommendation (based on real history, not just the static plan) ------
+
+TRAINING_RECOMMENDATION_PROMPT = """You are a strength coach reviewing a client's actual recent training history against their base program. Return ONLY JSON:
+{ "session_focus":string, "adjustment_note":string, "exercises":[ { "name":string, "sets":int, "reps":string, "notes":string, "demo_query":string } ] }
+session_focus is what today's session should target given the base plan and recent history. adjustment_note is 1-2 sentences explaining any change from the base plan (e.g. "increasing bench press weight since you hit all reps last 2 sessions" or "swapping in more core work since you've skipped it 3 sessions running"). Ground every adjustment in the actual history provided — don't invent progress that isn't there."""
+
+@api_router.get("/training/todays-recommendation")
+async def todays_recommendation():
+    try:
+        plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+        if not plan_doc:
+            raise HTTPException(status_code=404, detail="No plan found. Generate a plan first.")
+        base_training = plan_doc.get("plan", {}).get("training_split", {})
+        recent_logs = await db.workout_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(40)
+        user_prompt = (
+            f"Base training plan: {json.dumps(base_training)[:4000]}\n"
+            f"Last {len(recent_logs)} logged workout entries (most recent first): {json.dumps(recent_logs)[:4000]}\n"
+            "Recommend today's session, adjusted for what's actually been happening."
+        )
+        result = await call_claude_json(
+            TRAINING_RECOMMENDATION_PROMPT, user_prompt,
+            session_id=f"training-rec-{uuid.uuid4()}", max_tokens=2000,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Training recommendation failed")
+        raise HTTPException(status_code=500, detail="Could not generate today's recommendation.")
+
+
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware, allow_credentials=True,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def start_scheduler():
+    if VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY:
+        scheduler.start()
+        logger.info("Push notification scheduler started")
+    else:
+        logger.warning("VAPID keys not set — push notification scheduler NOT started")
 
 
 @app.on_event("shutdown")
