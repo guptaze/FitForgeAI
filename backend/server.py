@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Header, Depends
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -19,6 +19,8 @@ import certifi
 from pywebpush import webpush, WebPushException
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import bcrypt
+import jwt as pyjwt
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -31,6 +33,8 @@ CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5')
 VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
 VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
 VAPID_CONTACT_EMAIL = os.environ.get('VAPID_CONTACT_EMAIL', 'mailto:admin@fitforgeai.app')
+JWT_SECRET = os.environ.get('JWT_SECRET', 'insecure-dev-secret-change-me')
+JWT_ALGO = "HS256"
 
 mongo_client = AsyncIOMotorClient(MONGO_URL, tls=True, tlsCAFile=certifi.where())
 db = mongo_client[DB_NAME]
@@ -65,7 +69,50 @@ def extract_json(text: str) -> Dict[str, Any]:
     raise ValueError("No JSON found in LLM response")
 
 
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except Exception:
+        return False
+
+def create_token(user_id: str) -> str:
+    payload = {"user_id": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=30)}
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+async def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in.")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload["user_id"]
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    except pyjwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid session. Please log in again.")
+
+
 # ============== MODELS ==============
+
+class UserAccount(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    email: str
+    password_hash: str
+    name: str
+    created_at: str = Field(default_factory=utcnow_iso)
+
+class RegisterInput(BaseModel):
+    email: str
+    password: str
+    name: str
+
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
 
 class BodyMetrics(BaseModel):
     current_weight_kg: float
@@ -144,6 +191,10 @@ class FoodEntry(BaseModel):
     carbs_g: Optional[float] = None
     fat_g: Optional[float] = None
     notes: Optional[str] = None
+
+
+class FoodTextInput(BaseModel):
+    description: str
 
 
 class KitchenSuggestInput(BaseModel):
@@ -293,15 +344,52 @@ async def root():
     return {"app": "FitForge AI", "status": "ok"}
 
 
+# ------ Auth ------
+
+@api_router.post("/auth/register")
+async def register(payload: RegisterInput):
+    email = payload.email.lower().strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with this email already exists.")
+    user = UserAccount(email=email, password_hash=hash_password(payload.password), name=payload.name.strip())
+    await db.users.insert_one(user.dict())
+    token = create_token(user.id)
+    return {"token": token, "user": {"id": user.id, "email": user.email, "name": user.name}}
+
+
+@api_router.post("/auth/login")
+async def login(payload: LoginInput):
+    email = payload.email.lower().strip()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token = create_token(user["id"])
+    return {"token": token, "user": {"id": user["id"], "email": user["email"], "name": user["name"]}}
+
+
+@api_router.get("/auth/me")
+async def get_me(user_id: str = Depends(get_current_user_id)):
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return user
+
+
 @api_router.post("/profile")
-async def save_profile(payload: UserProfile):
+async def save_profile(payload: UserProfile, user_id: str = Depends(get_current_user_id)):
     doc = payload.dict()
-    await db.profile.update_one({}, {"$set": doc}, upsert=True)
+    doc["user_id"] = user_id
+    await db.profile.update_one({"user_id": user_id}, {"$set": doc}, upsert=True)
     return doc
 
 @api_router.get("/profile")
-async def get_profile():
-    doc = await db.profile.find_one({}, {"_id": 0})
+async def get_profile(user_id: str = Depends(get_current_user_id)):
+    doc = await db.profile.find_one({"user_id": user_id}, {"_id": 0})
     return doc or {}
 
 
@@ -311,13 +399,25 @@ NONVEG_KEYWORDS = [
 ]
 VEGAN_EXTRA_KEYWORDS = ["egg", "milk", "cheese", "yogurt", "yoghurt", "paneer", "butter", "ghee", "honey", "cream", "whey"]
 
-def banned_keywords_for_diet(diet_type: str) -> List[str]:
-    dt = (diet_type or "").lower()
+def normalize_diet_type(diet_type: str) -> str:
+    dt = (diet_type or "").strip().lower()
+    if "non-veg" in dt or "non veg" in dt or "nonveg" in dt or "pescatarian" in dt or "omnivore" in dt:
+        return "none"
     if "vegan" in dt:
-        return NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS
+        return "vegan"
     if "eggetarian" in dt:
+        return "eggetarian"
+    if "vegetarian" in dt or dt == "veg" or dt.startswith("veg "):
+        return "vegetarian"
+    return "none"
+
+def banned_keywords_for_diet(diet_type: str) -> List[str]:
+    norm = normalize_diet_type(diet_type)
+    if norm == "vegan":
+        return NONVEG_KEYWORDS + VEGAN_EXTRA_KEYWORDS
+    if norm == "eggetarian":
         return NONVEG_KEYWORDS
-    if "vegetarian" in dt:
+    if norm == "vegetarian":
         return NONVEG_KEYWORDS + ["egg"]
     return []
 
@@ -342,7 +442,7 @@ def find_diet_violations(plan_json: Dict[str, Any], diet_type: str) -> List[str]
 
 
 @api_router.post("/plan/generate")
-async def generate_plan(payload: PlanInput):
+async def generate_plan(payload: PlanInput, user_id: str = Depends(get_current_user_id)):
     try:
         meals_line = f", meals_per_day: {payload.diet.meals_per_day}" if payload.diet.meals_per_day else ""
         goals_line = f", goal_tags: {', '.join(payload.goals.goal_tags)}" if payload.goals.goal_tags else ""
@@ -373,6 +473,11 @@ For every exercise include demo_query (YouTube search string) and image_query (2
 
         # Deterministic diet-compliance safety net — don't rely on the prompt alone for a
         # health/allergy-adjacent correctness issue.
+        logger.info(
+            f"Diet check: raw diet_type='{payload.diet.diet_type}' "
+            f"normalized='{normalize_diet_type(payload.diet.diet_type)}' "
+            f"banned_keywords={len(banned_keywords_for_diet(payload.diet.diet_type))}"
+        )
         violations = find_diet_violations(plan_json, payload.diet.diet_type)
         if violations:
             logger.warning(f"Diet violations found, retrying with correction: {violations}")
@@ -398,7 +503,9 @@ For every exercise include demo_query (YouTube search string) and image_query (2
                         ] or meal.get("options", [])[:1]
 
         record = PlanRecord(input=payload.dict(), plan=plan_json)
-        await db.plans.insert_one(record.dict())
+        doc = record.dict()
+        doc["user_id"] = user_id
+        await db.plans.insert_one(doc)
         return {"id": record.id, "plan": plan_json, "created_at": record.created_at}
     except HTTPException:
         raise
@@ -411,8 +518,8 @@ For every exercise include demo_query (YouTube search string) and image_query (2
 
 
 @api_router.get("/plan/latest")
-async def latest_plan():
-    doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+async def latest_plan(user_id: str = Depends(get_current_user_id)):
+    doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
     if not doc:
         return {"plan": None}
     return doc
@@ -433,7 +540,7 @@ If field not mentioned, return null."""
 
 
 @api_router.post("/checkin/morning")
-async def morning_checkin(file: UploadFile = File(...)):
+async def morning_checkin(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
     try:
         audio_bytes = await file.read()
         transcript = await transcribe_audio(audio_bytes, file.filename or "checkin.m4a", file.content_type or "audio/m4a")
@@ -449,7 +556,9 @@ async def morning_checkin(file: UploadFile = File(...)):
             bowel_movement=parsed.get("bowel_movement"),
             sleep_quality=parsed.get("sleep_quality"),
         )
-        await db.checkins.insert_one(entry.dict())
+        doc = entry.dict()
+        doc["user_id"] = user_id
+        await db.checkins.insert_one(doc)
         return entry.dict()
     except HTTPException:
         raise
@@ -459,11 +568,12 @@ async def morning_checkin(file: UploadFile = File(...)):
 
 
 @api_router.post("/checkin/manual")
-async def manual_checkin(payload: ManualCheckin):
+async def manual_checkin(payload: ManualCheckin, user_id: str = Depends(get_current_user_id)):
     """Non-voice, tap-log check-in. Writes to the same `checkins` collection as the
     voice path so /api/overview's latest-weight logic picks it up automatically."""
     entry = {
         "id": str(uuid.uuid4()),
+        "user_id": user_id,
         "date": today_key(),
         "created_at": utcnow_iso(),
         "transcript": None,
@@ -490,8 +600,36 @@ ingredients_used must be a subset of the provided items that this recipe actuall
 HARD CONSTRAINT: the recipe must strictly comply with the user's stated diet type — if vegetarian, NEVER include meat, poultry, fish, or seafood; if vegan, NEVER include any animal product; if eggetarian, eggs are fine but no meat/fish/poultry. This is non-negotiable."""
 
 
+@api_router.post("/food/log-text")
+async def food_log_text(payload: FoodTextInput, user_id: str = Depends(get_current_user_id)):
+    try:
+        parsed = await call_claude_json(
+            FOOD_TEXT_PROMPT,
+            f"Food eaten: \"{payload.description}\"",
+            session_id=f"food-text-{uuid.uuid4()}",
+            max_tokens=500,
+        )
+        entry = FoodEntry(
+            source="text", transcript=payload.description,
+            food_items=parsed.get("food_items", []),
+            estimated_calories=int(parsed.get("estimated_calories", 0)),
+            protein_g=parsed.get("protein_g"), carbs_g=parsed.get("carbs_g"),
+            fat_g=parsed.get("fat_g"), notes=parsed.get("notes"),
+        )
+        doc = entry.dict()
+        doc["user_id"] = user_id
+        await db.food_logs.insert_one(doc)
+        doc.pop("_id", None)
+        return doc
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Food text log failed")
+        raise HTTPException(status_code=500, detail="Food text analysis failed.")
+
+
 @api_router.post("/food/log-voice")
-async def food_log_voice(file: UploadFile = File(...)):
+async def food_log_voice(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
     try:
         audio_bytes = await file.read()
         transcript = await transcribe_audio(audio_bytes, file.filename or "food.m4a", file.content_type or "audio/m4a")
@@ -508,7 +646,9 @@ async def food_log_voice(file: UploadFile = File(...)):
             protein_g=parsed.get("protein_g"), carbs_g=parsed.get("carbs_g"),
             fat_g=parsed.get("fat_g"), notes=parsed.get("notes"),
         )
-        await db.food_logs.insert_one(entry.dict())
+        doc = entry.dict()
+        doc["user_id"] = user_id
+        await db.food_logs.insert_one(doc)
         return entry.dict()
     except HTTPException:
         raise
@@ -518,7 +658,7 @@ async def food_log_voice(file: UploadFile = File(...)):
 
 
 @api_router.post("/food/log-image")
-async def food_log_image(payload: ImagePayload):
+async def food_log_image(payload: ImagePayload, user_id: str = Depends(get_current_user_id)):
     try:
         parsed = await call_claude_json(
             FOOD_IMAGE_PROMPT,
@@ -548,14 +688,16 @@ async def food_log_image(payload: ImagePayload):
         protein_g=parsed.get("protein_g"), carbs_g=parsed.get("carbs_g"),
         fat_g=parsed.get("fat_g"), notes=parsed.get("notes"),
     )
-    await db.food_logs.insert_one(entry.dict())
+    doc = entry.dict()
+    doc["user_id"] = user_id
+    await db.food_logs.insert_one(doc)
     return entry.dict()
 
 
 # ------ Logs / Aggregates ------
 
-async def _day_totals(date: str) -> Dict[str, Any]:
-    food = await db.food_logs.find({"date": date}, {"_id": 0}).sort("created_at", -1).to_list(200)
+async def _day_totals(date: str, user_id: str) -> Dict[str, Any]:
+    food = await db.food_logs.find({"date": date, "user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
     total_cal = sum(int(f.get("estimated_calories", 0)) for f in food)
     total_p = sum(float(f.get("protein_g") or 0) for f in food)
     total_c = sum(float(f.get("carbs_g") or 0) for f in food)
@@ -571,24 +713,100 @@ async def _day_totals(date: str) -> Dict[str, Any]:
     }
 
 @api_router.get("/logs/today")
-async def logs_today():
+async def logs_today(user_id: str = Depends(get_current_user_id)):
     date = today_key()
-    day = await _day_totals(date)
-    checkin = await db.checkins.find_one({"date": date}, {"_id": 0}, sort=[("created_at", -1)])
-    health = await db.health_samples.find_one({"date": date}, {"_id": 0}, sort=[("_id", -1)])
+    day = await _day_totals(date, user_id)
+    checkin = await db.checkins.find_one({"date": date, "user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    health = await db.health_samples.find_one({"date": date, "user_id": user_id}, {"_id": 0}, sort=[("_id", -1)])
     return {"date": date, **day, "morning_checkin": checkin, "health": health}
 
 
+@api_router.get("/logs/day")
+async def logs_by_date(date: str, user_id: str = Depends(get_current_user_id)):
+    """Full detail log sheet for any specific date (YYYY-MM-DD) — food, check-in,
+    workouts, and supplements taken that day."""
+    day = await _day_totals(date, user_id)
+    checkin = await db.checkins.find_one({"date": date, "user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    workouts = await db.workout_logs.find({"date": date, "user_id": user_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    supplements = await db.supplement_logs.find({"date": date, "user_id": user_id}, {"_id": 0}).to_list(100)
+    health = await db.health_samples.find_one({"date": date, "user_id": user_id}, {"_id": 0}, sort=[("_id", -1)])
+    return {
+        "date": date, **day,
+        "morning_checkin": checkin,
+        "workouts": workouts,
+        "supplements_taken": [s["supplement_name"] for s in supplements],
+        "health": health,
+    }
+
+
+@api_router.get("/history")
+async def history(days: int = 30, user_id: str = Depends(get_current_user_id)):
+    """Aggregated daily data across a date range, for charting weight/calorie/macro/
+    workout/supplement trends. Frontend picks `days` per filter: 7 for weekly, 30 for
+    monthly, 365 for yearly."""
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    checkins = await db.checkins.find(
+        {"date": {"$gte": start_date}, "user_id": user_id}, {"_id": 0}
+    ).sort("date", 1).to_list(days + 50)
+    weight_by_date: Dict[str, float] = {}
+    for c in checkins:
+        if c.get("weight_kg") is not None:
+            weight_by_date[c["date"]] = c["weight_kg"]
+
+    food_logs = await db.food_logs.find(
+        {"date": {"$gte": start_date}, "user_id": user_id}, {"_id": 0}
+    ).to_list(10000)
+    food_by_date: Dict[str, Dict[str, float]] = {}
+    for f in food_logs:
+        d = f["date"]
+        agg = food_by_date.setdefault(d, {"calories": 0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0})
+        agg["calories"] += int(f.get("estimated_calories", 0))
+        agg["protein_g"] += float(f.get("protein_g") or 0)
+        agg["carbs_g"] += float(f.get("carbs_g") or 0)
+        agg["fat_g"] += float(f.get("fat_g") or 0)
+
+    workouts = await db.workout_logs.find(
+        {"date": {"$gte": start_date}, "user_id": user_id}, {"_id": 0}
+    ).to_list(10000)
+    workout_by_date: Dict[str, int] = {}
+    for w in workouts:
+        workout_by_date[w["date"]] = workout_by_date.get(w["date"], 0) + 1
+
+    supp_logs = await db.supplement_logs.find(
+        {"date": {"$gte": start_date}, "user_id": user_id}, {"_id": 0}
+    ).to_list(10000)
+    supp_by_date: Dict[str, set] = {}
+    for s in supp_logs:
+        supp_by_date.setdefault(s["date"], set()).add(s["supplement_name"])
+
+    all_dates = sorted(set(weight_by_date) | set(food_by_date) | set(workout_by_date) | set(supp_by_date))
+    entries = []
+    for d in all_dates:
+        fd = food_by_date.get(d, {})
+        entries.append({
+            "date": d,
+            "weight_kg": weight_by_date.get(d),
+            "calories": fd.get("calories"),
+            "protein_g": round(fd["protein_g"], 1) if "protein_g" in fd else None,
+            "carbs_g": round(fd["carbs_g"], 1) if "carbs_g" in fd else None,
+            "fat_g": round(fd["fat_g"], 1) if "fat_g" in fd else None,
+            "workout_count": workout_by_date.get(d, 0),
+            "supplements_taken": len(supp_by_date.get(d, [])),
+        })
+    return {"days_requested": days, "entries": entries}
+
+
 @api_router.get("/overview")
-async def overview():
+async def overview(user_id: str = Depends(get_current_user_id)):
     today = today_key()
     yday = yesterday_key()
-    tday = await _day_totals(today)
-    yday_data = await _day_totals(yday)
-    checkin = await db.checkins.find_one({"date": today}, {"_id": 0}, sort=[("created_at", -1)])
-    latest_checkin = await db.checkins.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
-    health = await db.health_samples.find_one({"date": today}, {"_id": 0}, sort=[("_id", -1)])
-    plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+    tday = await _day_totals(today, user_id)
+    yday_data = await _day_totals(yday, user_id)
+    checkin = await db.checkins.find_one({"date": today, "user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    latest_checkin = await db.checkins.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    health = await db.health_samples.find_one({"date": today, "user_id": user_id}, {"_id": 0}, sort=[("_id", -1)])
+    plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
     nutri = (plan_doc or {}).get("plan", {}).get("nutrition_framework")
     targets = (plan_doc or {}).get("plan", {}).get("targets")
     return {
@@ -604,16 +822,17 @@ async def overview():
 
 
 @api_router.delete("/food/{entry_id}")
-async def delete_food(entry_id: str):
-    res = await db.food_logs.delete_one({"id": entry_id})
+async def delete_food(entry_id: str, user_id: str = Depends(get_current_user_id)):
+    res = await db.food_logs.delete_one({"id": entry_id, "user_id": user_id})
     return {"deleted": res.deleted_count}
 
 
 @api_router.post("/health/sync")
-async def sync_health(sample: HealthSample):
+async def sync_health(sample: HealthSample, user_id: str = Depends(get_current_user_id)):
     doc = sample.dict()
     doc["updated_at"] = utcnow_iso()
-    await db.health_samples.update_one({"date": sample.date}, {"$set": doc}, upsert=True)
+    doc["user_id"] = user_id
+    await db.health_samples.update_one({"date": sample.date, "user_id": user_id}, {"$set": doc}, upsert=True)
     doc.pop("_id", None)
     return doc
 
@@ -621,14 +840,15 @@ async def sync_health(sample: HealthSample):
 # ------ Workout logging ------
 
 @api_router.post("/workouts/log")
-async def log_workout(payload: WorkoutLog):
+async def log_workout(payload: WorkoutLog, user_id: str = Depends(get_current_user_id)):
     doc = payload.dict()
+    doc["user_id"] = user_id
     await db.workout_logs.insert_one(doc)
     doc.pop("_id", None)
     return doc
 
 @api_router.post("/workouts/log-session")
-async def log_workout_session(payload: WorkoutSessionInput):
+async def log_workout_session(payload: WorkoutSessionInput, user_id: str = Depends(get_current_user_id)):
     """Logs a full workout session (multiple exercises, each with its own sets) in one call.
     Writes one workout_logs document per exercise so existing /workouts/today and
     /workouts/history endpoints keep working unchanged."""
@@ -640,6 +860,7 @@ async def log_workout_session(payload: WorkoutSessionInput):
         weight_kg = next((s.w for s in reversed(ex.sets) if s.w is not None), None)
         doc = {
             "id": str(uuid.uuid4()),
+            "user_id": user_id,
             "date": date,
             "created_at": utcnow_iso(),
             "day_label": payload.session,
@@ -655,19 +876,19 @@ async def log_workout_session(payload: WorkoutSessionInput):
     return {"date": date, "session": payload.session, "logged": saved}
 
 @api_router.get("/workouts/today")
-async def workouts_today():
+async def workouts_today(user_id: str = Depends(get_current_user_id)):
     date = today_key()
-    logs = await db.workout_logs.find({"date": date}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    logs = await db.workout_logs.find({"date": date, "user_id": user_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
     return {"date": date, "logs": logs}
 
 @api_router.get("/workouts/history")
-async def workouts_history(days: int = 14):
-    logs = await db.workout_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+async def workouts_history(days: int = 14, user_id: str = Depends(get_current_user_id)):
+    logs = await db.workout_logs.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
     return {"logs": logs[: days * 20]}
 
 @api_router.delete("/workouts/{log_id}")
-async def delete_workout(log_id: str):
-    res = await db.workout_logs.delete_one({"id": log_id})
+async def delete_workout(log_id: str, user_id: str = Depends(get_current_user_id)):
+    res = await db.workout_logs.delete_one({"id": log_id, "user_id": user_id})
     return {"deleted": res.deleted_count}
 
 
@@ -696,7 +917,7 @@ Ground every recommendation in a specific marker reading. If report unclear or u
 
 
 @api_router.post("/bloodwork/upload-image")
-async def bloodwork_upload_image(payload: ImagePayload):
+async def bloodwork_upload_image(payload: ImagePayload, user_id: str = Depends(get_current_user_id)):
     try:
         parsed = await call_claude_json(
             BLOODWORK_PROMPT,
@@ -731,12 +952,14 @@ async def bloodwork_upload_image(payload: ImagePayload):
         raw_extract=None,
         suggestions=parsed,
     )
-    await db.bloodwork.insert_one(record.dict())
+    doc = record.dict()
+    doc["user_id"] = user_id
+    await db.bloodwork.insert_one(doc)
     return record.dict()
 
 
 @api_router.post("/bloodwork/upload-pdf")
-async def bloodwork_upload_pdf(file: UploadFile = File(...)):
+async def bloodwork_upload_pdf(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
     try:
         raw = await file.read()
         try:
@@ -759,7 +982,9 @@ async def bloodwork_upload_pdf(file: UploadFile = File(...)):
             raw_extract=text[:5000],
             suggestions=parsed,
         )
-        await db.bloodwork.insert_one(record.dict())
+        doc = record.dict()
+        doc["user_id"] = user_id
+        await db.bloodwork.insert_one(doc)
         return record.dict()
     except HTTPException:
         raise
@@ -769,23 +994,23 @@ async def bloodwork_upload_pdf(file: UploadFile = File(...)):
 
 
 @api_router.get("/bloodwork/latest")
-async def bloodwork_latest():
-    doc = await db.bloodwork.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+async def bloodwork_latest(user_id: str = Depends(get_current_user_id)):
+    doc = await db.bloodwork.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
     return doc or {}
 
 
 @api_router.delete("/bloodwork/{record_id}")
-async def bloodwork_delete(record_id: str):
-    res = await db.bloodwork.delete_one({"id": record_id})
+async def bloodwork_delete(record_id: str, user_id: str = Depends(get_current_user_id)):
+    res = await db.bloodwork.delete_one({"id": record_id, "user_id": user_id})
     return {"deleted": res.deleted_count}
 
 
 # ------ Kitchen-based recipe suggestion ------
 
 @api_router.post("/nutrition/kitchen-suggest")
-async def kitchen_suggest(payload: KitchenSuggestInput):
+async def kitchen_suggest(payload: KitchenSuggestInput, user_id: str = Depends(get_current_user_id)):
     try:
-        plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+        plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
         nutri = (plan_doc or {}).get("plan", {}).get("nutrition_framework", {})
         diet_type = (plan_doc or {}).get("input", {}).get("diet", {}).get("diet_type", "no restriction stated")
         user_prompt = (
@@ -822,21 +1047,22 @@ async def kitchen_suggest(payload: KitchenSuggestInput):
 # ------ Supplement logging ------
 
 @api_router.post("/supplements/log")
-async def log_supplement(payload: SupplementLog):
+async def log_supplement(payload: SupplementLog, user_id: str = Depends(get_current_user_id)):
     doc = payload.dict()
+    doc["user_id"] = user_id
     await db.supplement_logs.insert_one(doc)
     doc.pop("_id", None)
     return doc
 
 @api_router.get("/supplements/today")
-async def supplements_today():
+async def supplements_today(user_id: str = Depends(get_current_user_id)):
     date = today_key()
-    logs = await db.supplement_logs.find({"date": date}, {"_id": 0}).to_list(100)
+    logs = await db.supplement_logs.find({"date": date, "user_id": user_id}, {"_id": 0}).to_list(100)
     return {"date": date, "taken": [l["supplement_name"] for l in logs], "logs": logs}
 
 @api_router.delete("/supplements/{log_id}")
-async def delete_supplement_log(log_id: str):
-    res = await db.supplement_logs.delete_one({"id": log_id})
+async def delete_supplement_log(log_id: str, user_id: str = Depends(get_current_user_id)):
+    res = await db.supplement_logs.delete_one({"id": log_id, "user_id": user_id})
     return {"deleted": res.deleted_count}
 
 
@@ -921,13 +1147,13 @@ TRAINING_RECOMMENDATION_PROMPT = """You are a strength coach reviewing a client'
 session_focus is what today's session should target given the base plan and recent history. adjustment_note is 1-2 sentences explaining any change from the base plan (e.g. "increasing bench press weight since you hit all reps last 2 sessions" or "swapping in more core work since you've skipped it 3 sessions running"). Ground every adjustment in the actual history provided — don't invent progress that isn't there."""
 
 @api_router.get("/training/todays-recommendation")
-async def todays_recommendation():
+async def todays_recommendation(user_id: str = Depends(get_current_user_id)):
     try:
-        plan_doc = await db.plans.find_one({}, {"_id": 0}, sort=[("created_at", -1)])
+        plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
         if not plan_doc:
             raise HTTPException(status_code=404, detail="No plan found. Generate a plan first.")
         base_training = plan_doc.get("plan", {}).get("training_split", {})
-        recent_logs = await db.workout_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(40)
+        recent_logs = await db.workout_logs.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(40)
         user_prompt = (
             f"Base training plan: {json.dumps(base_training)[:4000]}\n"
             f"Last {len(recent_logs)} logged workout entries (most recent first): {json.dumps(recent_logs)[:4000]}\n"
