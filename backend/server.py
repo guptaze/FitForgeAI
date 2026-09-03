@@ -131,6 +131,7 @@ class Diet(BaseModel):
     meal_pattern: str
     cheat_day_policy: str
     meals_per_day: Optional[int] = None
+    foods_to_avoid: List[str] = []
 
 class Goals(BaseModel):
     aesthetic_goal: str
@@ -421,21 +422,21 @@ def banned_keywords_for_diet(diet_type: str) -> List[str]:
         return NONVEG_KEYWORDS + ["egg"]
     return []
 
-def text_violates_diet(name: str, description: str, diet_type: str) -> Optional[str]:
-    banned = banned_keywords_for_diet(diet_type)
+def text_violates_diet(name: str, description: str, diet_type: str, extra_avoid: List[str] = None) -> Optional[str]:
+    banned = banned_keywords_for_diet(diet_type) + [w.lower().strip() for w in (extra_avoid or []) if w.strip()]
     if not banned:
         return None
     text = f"{name or ''} {description or ''}".lower()
     return next((k for k in banned if k in text), None)
 
-def find_diet_violations(plan_json: Dict[str, Any], diet_type: str) -> List[str]:
-    banned = banned_keywords_for_diet(diet_type)
+def find_diet_violations(plan_json: Dict[str, Any], diet_type: str, extra_avoid: List[str] = None) -> List[str]:
+    banned = banned_keywords_for_diet(diet_type) + [w.lower().strip() for w in (extra_avoid or []) if w.strip()]
     if not banned:
         return []
     violations = []
     for meal in plan_json.get("meal_plan", []):
         for opt in meal.get("options", []):
-            hit = text_violates_diet(opt.get("name", ""), opt.get("description", ""), diet_type)
+            hit = text_violates_diet(opt.get("name", ""), opt.get("description", ""), diet_type, extra_avoid)
             if hit:
                 violations.append(f"{meal.get('meal','?')}: '{opt.get('name','?')}' (contains '{hit}')")
     return violations
@@ -446,13 +447,14 @@ async def generate_plan(payload: PlanInput, user_id: str = Depends(get_current_u
     try:
         meals_line = f", meals_per_day: {payload.diet.meals_per_day}" if payload.diet.meals_per_day else ""
         goals_line = f", goal_tags: {', '.join(payload.goals.goal_tags)}" if payload.goals.goal_tags else ""
+        avoid_line = f"\nFOODS TO AVOID (HARD CONSTRAINT, never include any of these in any meal option): {', '.join(payload.diet.foods_to_avoid)}" if payload.diet.foods_to_avoid else ""
 
         user_prompt = f"""Generate a full fat-loss + strength plan. Return valid JSON only per system schema.
 
 BODY: {payload.body.current_weight_kg} kg -> {payload.body.target_weight_kg} kg, height {payload.body.height_cm} cm, age {payload.body.age}, sex {payload.body.sex}
 TIMELINE: {payload.duration_months} months
 TRAINING: {payload.training.days_per_week} days/wk, {payload.training.minutes_per_session} min/session, window: {payload.training.preferred_window}
-DIET: type {payload.diet.diet_type}, pattern "{payload.diet.meal_pattern}", cheat: "{payload.diet.cheat_day_policy}"{meals_line}
+DIET: type {payload.diet.diet_type}, pattern "{payload.diet.meal_pattern}", cheat: "{payload.diet.cheat_day_policy}"{meals_line}{avoid_line}
 INJURIES: {payload.injuries or 'None'}
 GOALS: {payload.goals.aesthetic_goal}, focus {', '.join(payload.goals.focus_muscles)}, pace {payload.goals.pace}{goals_line}
 SCHEDULE: {payload.daily_schedule}
@@ -472,34 +474,37 @@ For every exercise include demo_query (YouTube search string) and image_query (2
             )
 
         # Deterministic diet-compliance safety net — don't rely on the prompt alone for a
-        # health/allergy-adjacent correctness issue.
+        # health/allergy-adjacent correctness issue. Covers both the diet_type category
+        # AND the user's own custom foods_to_avoid list.
         logger.info(
             f"Diet check: raw diet_type='{payload.diet.diet_type}' "
             f"normalized='{normalize_diet_type(payload.diet.diet_type)}' "
-            f"banned_keywords={len(banned_keywords_for_diet(payload.diet.diet_type))}"
+            f"banned_keywords={len(banned_keywords_for_diet(payload.diet.diet_type))} "
+            f"foods_to_avoid={payload.diet.foods_to_avoid}"
         )
-        violations = find_diet_violations(plan_json, payload.diet.diet_type)
+        violations = find_diet_violations(plan_json, payload.diet.diet_type, payload.diet.foods_to_avoid)
         if violations:
             logger.warning(f"Diet violations found, retrying with correction: {violations}")
             correction_prompt = user_prompt + (
                 f"\n\nYour previous attempt incorrectly included these non-compliant items: "
                 f"{'; '.join(violations)}. Regenerate the ENTIRE plan, making sure every single "
-                f"meal_plan option strictly complies with diet_type={payload.diet.diet_type}."
+                f"meal_plan option strictly complies with diet_type={payload.diet.diet_type} "
+                f"and avoids: {', '.join(payload.diet.foods_to_avoid) if payload.diet.foods_to_avoid else '(none)'}."
             )
             plan_json = await call_claude_json(
                 PLAN_SYSTEM_PROMPT, correction_prompt,
                 session_id=f"plan-dietfix-{uuid.uuid4()}", max_tokens=16000,
             )
-            violations = find_diet_violations(plan_json, payload.diet.diet_type)
+            violations = find_diet_violations(plan_json, payload.diet.diet_type, payload.diet.foods_to_avoid)
             if violations:
                 # Last resort: strip non-compliant options rather than serve them.
                 logger.warning(f"Diet violations persisted after retry, filtering: {violations}")
-                banned = banned_keywords_for_diet(payload.diet.diet_type)
+                banned = banned_keywords_for_diet(payload.diet.diet_type) + payload.diet.foods_to_avoid
                 if banned:
                     for meal in plan_json.get("meal_plan", []):
                         meal["options"] = [
                             o for o in meal.get("options", [])
-                            if not text_violates_diet(o.get("name", ""), o.get("description", ""), payload.diet.diet_type)
+                            if not text_violates_diet(o.get("name", ""), o.get("description", ""), payload.diet.diet_type, payload.diet.foods_to_avoid)
                         ] or meal.get("options", [])[:1]
 
         record = PlanRecord(input=payload.dict(), plan=plan_json)
@@ -1013,23 +1018,25 @@ async def kitchen_suggest(payload: KitchenSuggestInput, user_id: str = Depends(g
         plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
         nutri = (plan_doc or {}).get("plan", {}).get("nutrition_framework", {})
         diet_type = (plan_doc or {}).get("input", {}).get("diet", {}).get("diet_type", "no restriction stated")
+        foods_to_avoid = (plan_doc or {}).get("input", {}).get("diet", {}).get("foods_to_avoid", [])
+        avoid_line = f"\nFoods to avoid (MUST strictly follow): {', '.join(foods_to_avoid)}" if foods_to_avoid else ""
         user_prompt = (
             f"Ingredients on hand: {', '.join(payload.items) if payload.items else 'none listed'}\n"
-            f"User's diet type (MUST strictly follow): {diet_type}\n"
+            f"User's diet type (MUST strictly follow): {diet_type}{avoid_line}\n"
             f"User's daily nutrition targets: {json.dumps(nutri)}\n"
-            "Suggest one recipe using mostly these ingredients, strictly respecting the diet type above."
+            "Suggest one recipe using mostly these ingredients, strictly respecting the diet type and avoid-list above."
         )
         result = await call_claude_json(
             KITCHEN_SUGGEST_PROMPT, user_prompt,
             session_id=f"kitchen-{uuid.uuid4()}", max_tokens=1500,
         )
 
-        hit = text_violates_diet(result.get("name", ""), result.get("description", ""), diet_type)
+        hit = text_violates_diet(result.get("name", ""), result.get("description", ""), diet_type, foods_to_avoid)
         if hit:
             logger.warning(f"Kitchen suggestion violated diet ({hit}), retrying")
             correction_prompt = user_prompt + (
                 f"\n\nYour previous suggestion incorrectly contained '{hit}', which violates diet type "
-                f"{diet_type}. Suggest a different recipe that strictly complies."
+                f"{diet_type} or the avoid-list. Suggest a different recipe that strictly complies."
             )
             result = await call_claude_json(
                 KITCHEN_SUGGEST_PROMPT, correction_prompt,
