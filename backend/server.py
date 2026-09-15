@@ -427,7 +427,12 @@ def text_violates_diet(name: str, description: str, diet_type: str, extra_avoid:
     if not banned:
         return None
     text = f"{name or ''} {description or ''}".lower()
-    return next((k for k in banned if k in text), None)
+    # Word-boundary matching, not raw substring — "egg" must not match inside "veggies",
+    # "meat" must not match inside "oatmeal", etc.
+    for k in banned:
+        if re.search(r'\b' + re.escape(k) + r'\b', text):
+            return k
+    return None
 
 def find_diet_violations(plan_json: Dict[str, Any], diet_type: str, extra_avoid: List[str] = None) -> List[str]:
     banned = banned_keywords_for_diet(diet_type) + [w.lower().strip() for w in (extra_avoid or []) if w.strip()]
