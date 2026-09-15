@@ -535,16 +535,25 @@ async def latest_plan(user_id: str = Depends(get_current_user_id)):
     diet_type = diet_input.get("diet_type", "")
     foods_to_avoid = diet_input.get("foods_to_avoid", [])
     banned = banned_keywords_for_diet(diet_type) + [w.lower().strip() for w in (foods_to_avoid or []) if w.strip()]
+    total_removed = 0
+    logger.info(
+        f"Plan read filter: plan_created_at='{doc.get('created_at')}' "
+        f"stored_diet_type='{diet_type}' stored_foods_to_avoid={foods_to_avoid} "
+        f"banned_count={len(banned)} has_meal_plan={bool(doc.get('plan', {}).get('meal_plan'))}"
+    )
     if banned and doc.get("plan", {}).get("meal_plan"):
         for meal in doc["plan"]["meal_plan"]:
+            before = len(meal.get("options", []))
             clean = [
                 o for o in meal.get("options", [])
                 if not text_violates_diet(o.get("name", ""), o.get("description", ""), diet_type, foods_to_avoid)
             ]
+            total_removed += before - len(clean)
             if clean:
                 meal["options"] = clean
             # If every option happened to violate (shouldn't happen, but don't leave the
             # meal empty) — leave the original options in place rather than showing nothing.
+    logger.info(f"Plan read filter: removed {total_removed} non-compliant option(s) on this read")
     return doc
 
 
