@@ -527,6 +527,24 @@ async def latest_plan(user_id: str = Depends(get_current_user_id)):
     doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
     if not doc:
         return {"plan": None}
+    # Defensive filter: clean non-compliant meal options on every READ, not just at
+    # generation time. Catches old cached plans, frontend hiccups, or any future gap —
+    # uses the diet_type/foods_to_avoid actually stored with this plan, so it's correct
+    # regardless of what happened when it was generated.
+    diet_input = (doc.get("input") or {}).get("diet") or {}
+    diet_type = diet_input.get("diet_type", "")
+    foods_to_avoid = diet_input.get("foods_to_avoid", [])
+    banned = banned_keywords_for_diet(diet_type) + [w.lower().strip() for w in (foods_to_avoid or []) if w.strip()]
+    if banned and doc.get("plan", {}).get("meal_plan"):
+        for meal in doc["plan"]["meal_plan"]:
+            clean = [
+                o for o in meal.get("options", [])
+                if not text_violates_diet(o.get("name", ""), o.get("description", ""), diet_type, foods_to_avoid)
+            ]
+            if clean:
+                meal["options"] = clean
+            # If every option happened to violate (shouldn't happen, but don't leave the
+            # meal empty) — leave the original options in place rather than showing nothing.
     return doc
 
 
@@ -799,7 +817,11 @@ async def history(days: int = 30, user_id: str = Depends(get_current_user_id)):
             "workout_count": workout_by_date.get(d, 0),
             "supplements_taken": len(supp_by_date.get(d, [])),
         })
-    return {"days_requested": days, "entries": entries}
+
+    plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    goal_weight_kg = (plan_doc or {}).get("input", {}).get("body", {}).get("target_weight_kg")
+
+    return {"days_requested": days, "goal_weight_kg": goal_weight_kg, "entries": entries}
 
 
 @api_router.get("/overview")
@@ -1176,6 +1198,178 @@ async def todays_recommendation(user_id: str = Depends(get_current_user_id)):
     except Exception:
         logger.exception("Training recommendation failed")
         raise HTTPException(status_code=500, detail="Could not generate today's recommendation.")
+
+
+# ------ Deterministic progression, pre-fill, 1RM, and muscle heatmap ------
+# (ported concepts from openGym's rule-based progression system — deterministic,
+# no AI call needed, computed straight from logged history)
+
+def epley_1rm(weight_kg: float, reps: int) -> float:
+    if reps <= 1:
+        return weight_kg
+    if reps > 12:
+        return weight_kg  # formula gets unreliable past ~12 reps, don't overclaim
+    return round(weight_kg * (1 + reps / 30), 1)
+
+
+@api_router.get("/workouts/last-weights")
+async def last_weights(user_id: str = Depends(get_current_user_id)):
+    """Most recent weight/reps logged per exercise, so the workout screen can pre-fill
+    today's session instead of starting from blank fields."""
+    logs = await db.workout_logs.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    last_by_exercise: Dict[str, Dict[str, Any]] = {}
+    for log in logs:
+        name = log.get("exercise_name")
+        if name and name not in last_by_exercise:
+            last_by_exercise[name] = {
+                "weight_kg": log.get("weight_kg"),
+                "reps": log.get("reps"),
+                "sets_done": log.get("sets_done"),
+                "date": log.get("date"),
+            }
+    return {"exercises": last_by_exercise}
+
+
+@api_router.get("/training/progression")
+async def training_progression(exercise: str, user_id: str = Depends(get_current_user_id)):
+    """Deterministic next-session suggestion for one exercise — no AI call, just a rule:
+    increase weight after 2 clean sessions hitting top of rep range, deload after 2
+    straight misses. This is the openGym-style rule-based approach, complementing (not
+    replacing) the AI-narrative /training/todays-recommendation."""
+    logs = await db.workout_logs.find(
+        {"user_id": user_id, "exercise_name": exercise}, {"_id": 0}
+    ).sort("created_at", -1).to_list(10)
+
+    if not logs:
+        return {"exercise": exercise, "history_found": False, "suggestion": "No history yet for this exercise — log a session to start tracking progression."}
+
+    last = logs[0]
+    last_weight = last.get("weight_kg")
+    last_reps_str = last.get("reps") or ""
+    rep_values = [int(r) for r in last_reps_str.split(",") if r.strip().isdigit()]
+    target_reps = 10  # generic top-of-range assumption when the plan doesn't specify one
+
+    hit_target_streak = 0
+    missed_streak = 0
+    for log in logs:
+        reps_str = log.get("reps") or ""
+        vals = [int(r) for r in reps_str.split(",") if r.strip().isdigit()]
+        if not vals:
+            break
+        if min(vals) >= target_reps:
+            hit_target_streak += 1
+            missed_streak = 0
+        else:
+            missed_streak += 1
+            break  # streak broken, stop counting
+
+    best_1rm = None
+    if last_weight and rep_values:
+        best_1rm = epley_1rm(last_weight, max(rep_values))
+
+    if hit_target_streak >= 2 and last_weight:
+        increment = 2.5 if last_weight >= 20 else 1.0
+        return {
+            "exercise": exercise, "history_found": True,
+            "suggested_weight_kg": round(last_weight + increment, 1),
+            "suggested_reps": target_reps,
+            "reason": f"Hit {target_reps}+ reps for {hit_target_streak} sessions running — time to add weight.",
+            "estimated_1rm_kg": best_1rm,
+        }
+    if missed_streak >= 2 and last_weight:
+        deload = round(last_weight * 0.9, 1)
+        return {
+            "exercise": exercise, "history_found": True,
+            "suggested_weight_kg": deload,
+            "suggested_reps": target_reps,
+            "reason": f"Missed target reps {missed_streak} sessions running — deloading 10% to reset.",
+            "estimated_1rm_kg": best_1rm,
+        }
+    return {
+        "exercise": exercise, "history_found": True,
+        "suggested_weight_kg": last_weight,
+        "suggested_reps": target_reps,
+        "reason": "Stay at the same weight — keep building consistency at this load before increasing.",
+        "estimated_1rm_kg": best_1rm,
+    }
+
+
+@api_router.get("/training/muscle-heatmap")
+async def muscle_heatmap(days: int = 30, user_id: str = Depends(get_current_user_id)):
+    """Aggregates logged workout volume by muscle group over the given window. Muscle
+    group is looked up by matching the logged exercise name against the current plan's
+    training_split (best-effort — exercises not found in the plan count as 'other')."""
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    plan_doc = await db.plans.find_one({"user_id": user_id}, {"_id": 0}, sort=[("created_at", -1)])
+    name_to_muscle: Dict[str, str] = {}
+    if plan_doc:
+        for day in plan_doc.get("plan", {}).get("training_split", {}).get("table", []):
+            for ex in day.get("exercises", []):
+                if ex.get("name"):
+                    name_to_muscle[ex["name"].lower()] = ex.get("muscle_group", "other")
+
+    logs = await db.workout_logs.find(
+        {"user_id": user_id, "date": {"$gte": start_date}}, {"_id": 0}
+    ).to_list(2000)
+
+    volume_by_muscle: Dict[str, int] = {}
+    for log in logs:
+        muscle = name_to_muscle.get((log.get("exercise_name") or "").lower(), "other")
+        volume_by_muscle[muscle] = volume_by_muscle.get(muscle, 0) + int(log.get("sets_done") or 0)
+
+    all_muscle_groups = ["chest", "back", "legs", "shoulders", "arms", "core", "cardio", "other"]
+    trained = set(volume_by_muscle.keys())
+    untrained = [m for m in all_muscle_groups if m not in trained and m != "other"]
+
+    return {
+        "days": days,
+        "volume_by_muscle": volume_by_muscle,
+        "untrained_muscle_groups": untrained,
+    }
+
+
+# ------ Basic import from Strong / Hevy style CSV exports ------
+
+class ImportRow(BaseModel):
+    date: str
+    exercise_name: str
+    weight_kg: Optional[float] = None
+    reps: Optional[int] = None
+    day_label: Optional[str] = None
+
+class ImportInput(BaseModel):
+    rows: List[ImportRow]
+
+@api_router.post("/workouts/import")
+async def import_workouts(payload: ImportInput, user_id: str = Depends(get_current_user_id)):
+    """Bulk-import previously logged workouts (e.g. parsed from a Strong or Hevy CSV
+    export). The frontend is responsible for parsing the CSV into this row shape —
+    column layouts differ slightly per app, easier to map on the client than guess here."""
+    grouped: Dict[tuple, List[ImportRow]] = {}
+    for row in payload.rows:
+        key = (row.date, row.exercise_name)
+        grouped.setdefault(key, []).append(row)
+
+    imported = 0
+    for (date, exercise_name), rows in grouped.items():
+        weights = [r.weight_kg for r in rows if r.weight_kg is not None]
+        reps_list = [str(r.reps) for r in rows if r.reps is not None]
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "date": date,
+            "created_at": utcnow_iso(),
+            "day_label": rows[0].day_label or "Imported",
+            "exercise_name": exercise_name,
+            "sets_done": len(rows),
+            "reps": ",".join(reps_list),
+            "weight_kg": max(weights) if weights else None,
+            "notes": "Imported from external app",
+        }
+        await db.workout_logs.insert_one(doc)
+        imported += 1
+    return {"imported_exercise_entries": imported, "total_sets": len(payload.rows)}
 
 
 app.include_router(api_router)
